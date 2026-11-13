@@ -24,8 +24,9 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Obfuscation-immune LSPosed module that displays a user's Data Center (DC)
- * and User ID right under their profile picture in ProfileActivity.
+ * Obfuscation-immune LSPosed module that displays Data Center (DC) and ID
+ * right under profile pictures in ProfileActivity for both users and
+ * groups/supergroups/channels.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -95,19 +96,35 @@ public class MainHook implements IXposedHookLoadPackage {
             if (args == null) {
                 return;
             }
+
             long userId = args.getLong("user_id", 0L);
-            if (userId == 0L) {
+            long chatId = args.getLong("chat_id", 0L);
+            if (userId == 0L && chatId == 0L) {
                 return;
             }
 
             Object messagesController = XposedHelpers.callMethod(profileActivity, "getMessagesController");
-            Object user = findUserById(messagesController, userId, cl);
-            int dcId = extractDcId(user);
-            String firstName = extractStringField(user, "first_name");
+            int dcId;
+            String displayId;
+            String titleOrFirstName;
+
+            if (userId != 0L) {
+                Object user = findEntityById(messagesController, userId, "org.telegram.tgnet.TLRPC$User", cl);
+                dcId = extractDcId(user);
+                displayId = String.valueOf(userId);
+                titleOrFirstName = extractStringField(user, "first_name");
+            } else {
+                Object chat = findEntityById(messagesController, chatId, "org.telegram.tgnet.TLRPC$Chat", cl);
+                dcId = extractDcId(chat);
+                boolean isChannelOrSupergroup = chat != null
+                        && chat.getClass().getSimpleName().toLowerCase().contains("channel");
+                displayId = isChannelOrSupergroup ? ("-100" + chatId) : String.valueOf(chatId);
+                titleOrFirstName = extractStringField(chat, "title");
+            }
 
             String badge = dcId > 0
-                    ? " · DC " + dcId + " · ID " + userId
-                    : " · ID " + userId;
+                    ? " · DC " + dcId + " · ID " + displayId
+                    : " · ID " + displayId;
 
             List<View> candidates = new ArrayList<>();
             for (Field field : profileActivity.getClass().getDeclaredFields()) {
@@ -125,21 +142,20 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
 
-            logD("attachProfileInfo: userId=" + userId + ", dcId=" + dcId + ", candidates=" + candidates.size());
+            logD("attachProfileInfo: id=" + displayId + ", dcId=" + dcId + ", candidates=" + candidates.size());
 
             for (View view : candidates) {
                 CharSequence existing = getCurrentText(view);
-                // Skip the display name view (first_name) when multiple SimpleTextView fields exist
-                if (candidates.size() > 1 && firstName != null && !firstName.isEmpty()
-                        && existing != null && existing.toString().startsWith(firstName)) {
-                    logD("Skipping name view " + view.getClass().getSimpleName() + " ('" + existing + "')");
+                if (candidates.size() > 1 && titleOrFirstName != null && !titleOrFirstName.isEmpty()
+                        && existing != null && existing.toString().startsWith(titleOrFirstName)) {
+                    logD("Skipping title/name view " + view.getClass().getSimpleName() + " ('" + existing + "')");
                     continue;
                 }
 
                 hookSimpleTextViewHierarchy(view.getClass());
                 viewInfoMap.put(view, badge);
 
-                if (existing != null && !existing.toString().contains("ID " + userId)) {
+                if (existing != null && !existing.toString().contains("ID " + displayId)) {
                     invokeTextSetter(view, appendBadge(existing, badge));
                 }
             }
@@ -148,10 +164,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Walks the class hierarchy (from the view's concrete class up to View.class)
-     * so inherited text setters on subclasses like org.telegram.ui.gw0 are hooked.
-     */
     private void hookSimpleTextViewHierarchy(Class<?> leafCls) {
         for (Class<?> cls = leafCls; cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
             if (!hookedTextClasses.add(cls)) {
@@ -160,8 +172,6 @@ public class MainHook implements IXposedHookLoadPackage {
             int hookedCount = 0;
             for (Method m : cls.getDeclaredMethods()) {
                 if (isTextSetterMethod(m)) {
-                    logD("Hooking text setter: " + cls.getName() + "." + m.getName()
-                            + "(" + Arrays.toString(m.getParameterTypes()) + ")");
                     hookedCount++;
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
@@ -228,7 +238,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     try {
                         m.setAccessible(true);
                         m.invoke(view, text, false);
-                        logD("invokeTextSetter(2-arg) succeeded via " + cls.getSimpleName() + "." + m.getName());
                         return;
                     } catch (Throwable t) {
                         logE("invokeTextSetter failed on " + m.getName(), t);
@@ -245,7 +254,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     try {
                         m.setAccessible(true);
                         m.invoke(view, text);
-                        logD("invokeTextSetter(1-arg) succeeded via " + cls.getSimpleName() + "." + m.getName());
                         return;
                     } catch (Throwable t) {
                         logE("invokeTextSetter failed on " + m.getName(), t);
@@ -255,21 +263,21 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static Object findUserById(Object messagesController, long userId, ClassLoader cl) {
+    private static Object findEntityById(Object messagesController, long id, String entityClassName, ClassLoader cl) {
         if (messagesController == null) {
             return null;
         }
-        Class<?> userCls = XposedHelpers.findClassIfExists("org.telegram.tgnet.TLRPC$User", cl);
-        if (userCls == null) {
+        Class<?> entityCls = XposedHelpers.findClassIfExists(entityClassName, cl);
+        if (entityCls == null) {
             return null;
         }
         for (Method m : messagesController.getClass().getMethods()) {
             Class<?>[] params = m.getParameterTypes();
             if (params.length == 1
                     && (params[0] == Long.class || params[0] == long.class)
-                    && userCls.isAssignableFrom(m.getReturnType())) {
+                    && entityCls.isAssignableFrom(m.getReturnType())) {
                 try {
-                    Object res = m.invoke(messagesController, userId);
+                    Object res = m.invoke(messagesController, id);
                     if (res != null) {
                         return res;
                     }
@@ -292,12 +300,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static int extractDcId(Object user) {
-        if (user == null) {
+    private static int extractDcId(Object entity) {
+        if (entity == null) {
             return 0;
         }
         try {
-            Object photo = XposedHelpers.getObjectField(user, "photo");
+            Object photo = XposedHelpers.getObjectField(entity, "photo");
             if (photo == null) {
                 return 0;
             }
