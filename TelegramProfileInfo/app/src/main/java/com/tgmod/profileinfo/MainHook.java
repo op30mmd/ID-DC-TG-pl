@@ -8,9 +8,11 @@ import android.view.View;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -24,9 +26,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Obfuscation-immune LSPosed module that displays a user's Data Center (DC)
  * and User ID right under their profile picture in ProfileActivity.
- *
- * Includes verbose debug logging to both LSPosed Logs (XposedBridge.log)
- * and Android logcat (tag: TG-ProfileInfo).
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -71,7 +70,6 @@ public class MainHook implements IXposedHookLoadPackage {
             logE("ProfileActivity class NOT found in " + lpparam.packageName, null);
             return;
         }
-        logD("Found ProfileActivity: " + profileActivityCls.getName());
 
         try {
             XposedHelpers.findAndHookMethod(
@@ -81,7 +79,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            logD("ProfileActivity.createView() fired on " + param.thisObject);
                             attachProfileInfo(param.thisObject, cl);
                         }
                     }
@@ -96,110 +93,110 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Bundle args = (Bundle) XposedHelpers.callMethod(profileActivity, "getArguments");
             if (args == null) {
-                logD("attachProfileInfo: getArguments() returned null");
                 return;
             }
             long userId = args.getLong("user_id", 0L);
-            logD("attachProfileInfo: user_id=" + userId + ", chat_id=" + args.getLong("chat_id", 0L));
             if (userId == 0L) {
-                logD("attachProfileInfo: skipping (not a user profile)");
                 return;
             }
 
             Object messagesController = XposedHelpers.callMethod(profileActivity, "getMessagesController");
-            logD("attachProfileInfo: messagesController=" + (messagesController != null ? messagesController.getClass().getName() : "null"));
-
             Object user = findUserById(messagesController, userId, cl);
-            logD("attachProfileInfo: resolved user=" + (user != null ? user.getClass().getName() : "null"));
-
             int dcId = extractDcId(user);
-            logD("attachProfileInfo: extracted dc_id=" + dcId);
+            String firstName = extractStringField(user, "first_name");
 
             String badge = dcId > 0
                     ? " · DC " + dcId + " · ID " + userId
                     : " · ID " + userId;
 
-            int matchedViews = 0;
+            List<View> candidates = new ArrayList<>();
             for (Field field : profileActivity.getClass().getDeclaredFields()) {
                 Class<?> fType = field.getType();
                 if (!View.class.isAssignableFrom(fType)) {
                     continue;
                 }
-                boolean hasRightDrawableInside = hasMethod(fType, "setRightDrawableInside", boolean.class);
-                if (!hasRightDrawableInside) {
+                if (!hasMethod(fType, "setRightDrawableInside", boolean.class)) {
                     continue;
                 }
                 field.setAccessible(true);
                 Object viewObj = field.get(profileActivity);
-                logD("Candidate SimpleTextView field: " + field.getName()
-                        + " type=" + fType.getName()
-                        + " instance=" + viewObj
-                        + " tag=" + (viewObj instanceof View ? ((View) viewObj).getTag() : "n/a"));
-
-                if (!(viewObj instanceof View)) {
-                    continue;
-                }
-                View statusView = (View) viewObj;
-                matchedViews++;
-                hookSimpleTextViewClass(statusView.getClass());
-                viewInfoMap.put(statusView, badge);
-
-                CharSequence existing = getCurrentText(statusView);
-                logD("Candidate field " + field.getName() + " existingText=" + existing);
-                if (existing != null && !existing.toString().contains("ID " + userId)) {
-                    invokeTextSetter(statusView, appendBadge(existing, badge));
+                if (viewObj instanceof View) {
+                    candidates.add((View) viewObj);
                 }
             }
-            logD("attachProfileInfo: total matched SimpleTextView fields=" + matchedViews);
+
+            logD("attachProfileInfo: userId=" + userId + ", dcId=" + dcId + ", candidates=" + candidates.size());
+
+            for (View view : candidates) {
+                CharSequence existing = getCurrentText(view);
+                // Skip the display name view (first_name) when multiple SimpleTextView fields exist
+                if (candidates.size() > 1 && firstName != null && !firstName.isEmpty()
+                        && existing != null && existing.toString().startsWith(firstName)) {
+                    logD("Skipping name view " + view.getClass().getSimpleName() + " ('" + existing + "')");
+                    continue;
+                }
+
+                hookSimpleTextViewHierarchy(view.getClass());
+                viewInfoMap.put(view, badge);
+
+                if (existing != null && !existing.toString().contains("ID " + userId)) {
+                    invokeTextSetter(view, appendBadge(existing, badge));
+                }
+            }
         } catch (Throwable t) {
             logE("attachProfileInfo error", t);
         }
     }
 
-    private void hookSimpleTextViewClass(Class<?> cls) {
-        if (!hookedTextClasses.add(cls)) {
-            return;
-        }
-        logD("Inspecting SimpleTextView class for text setters: " + cls.getName());
-        int hookedCount = 0;
-        for (Method m : cls.getDeclaredMethods()) {
-            Class<?>[] params = m.getParameterTypes();
-            boolean isTwoArgSetter = params.length == 2
-                    && params[0] == CharSequence.class
-                    && params[1] == boolean.class
-                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class);
-            boolean isOneArgSetter = params.length == 1
-                    && params[0] == CharSequence.class
-                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class);
-
-            if (isTwoArgSetter || isOneArgSetter) {
-                logD("Hooking text setter: " + cls.getSimpleName() + "." + m.getName()
-                        + "(" + Arrays.toString(params) + ") -> " + m.getReturnType().getSimpleName());
-                hookedCount++;
-                XposedBridge.hookMethod(m, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        if (!(param.thisObject instanceof View)) {
-                            return;
-                        }
-                        View view = (View) param.thisObject;
-                        String badge = viewInfoMap.get(view);
-                        if (badge == null) {
-                            return;
-                        }
-                        CharSequence text = (CharSequence) param.args[0];
-                        logD("Text setter fired on " + view.getClass().getSimpleName()
-                                + " tag=" + view.getTag()
-                                + " text='" + text + "'");
-                        if (text != null && !text.toString().contains(badge)) {
-                            param.args[0] = appendBadge(text, badge);
-                            logD("Appended badge -> '" + param.args[0] + "'");
-                        }
-                    }
-                });
+    /**
+     * Walks the class hierarchy (from the view's concrete class up to View.class)
+     * so inherited text setters on subclasses like org.telegram.ui.gw0 are hooked.
+     */
+    private void hookSimpleTextViewHierarchy(Class<?> leafCls) {
+        for (Class<?> cls = leafCls; cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
+            if (!hookedTextClasses.add(cls)) {
+                continue;
             }
+            int hookedCount = 0;
+            for (Method m : cls.getDeclaredMethods()) {
+                if (isTextSetterMethod(m)) {
+                    logD("Hooking text setter: " + cls.getName() + "." + m.getName()
+                            + "(" + Arrays.toString(m.getParameterTypes()) + ")");
+                    hookedCount++;
+                    XposedBridge.hookMethod(m, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!(param.thisObject instanceof View)) {
+                                return;
+                            }
+                            View view = (View) param.thisObject;
+                            String badge = viewInfoMap.get(view);
+                            if (badge == null) {
+                                return;
+                            }
+                            CharSequence text = (CharSequence) param.args[0];
+                            if (text != null && !text.toString().contains(badge)) {
+                                param.args[0] = appendBadge(text, badge);
+                                logD("Appended badge -> '" + param.args[0] + "'");
+                            }
+                        }
+                    });
+                }
+            }
+            logD("Hooked " + hookedCount + " text setter(s) on " + cls.getName());
         }
-        logD("Hooked " + hookedCount + " text setter(s) on " + cls.getName());
+    }
+
+    private static boolean isTextSetterMethod(Method m) {
+        Class<?>[] params = m.getParameterTypes();
+        Class<?> ret = m.getReturnType();
+        if (ret != boolean.class && ret != void.class) {
+            return false;
+        }
+        if (params.length == 2 && params[0] == CharSequence.class && params[1] == boolean.class) {
+            return true;
+        }
+        return params.length == 1 && params[0] == CharSequence.class;
     }
 
     private static CharSequence appendBadge(CharSequence base, String badge) {
@@ -222,19 +219,37 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static void invokeTextSetter(View view, CharSequence text) {
-        for (Method m : view.getClass().getDeclaredMethods()) {
-            Class<?>[] params = m.getParameterTypes();
-            if (params.length == 2
-                    && params[0] == CharSequence.class
-                    && params[1] == boolean.class
-                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class)) {
-                try {
-                    m.setAccessible(true);
-                    m.invoke(view, text, false);
-                    logD("invokeTextSetter succeeded via " + m.getName());
-                    return;
-                } catch (Throwable t) {
-                    logE("invokeTextSetter failed on " + m.getName(), t);
+        for (Class<?> cls = view.getClass(); cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
+            for (Method m : cls.getDeclaredMethods()) {
+                Class<?>[] params = m.getParameterTypes();
+                Class<?> ret = m.getReturnType();
+                if (params.length == 2 && params[0] == CharSequence.class && params[1] == boolean.class
+                        && (ret == boolean.class || ret == void.class)) {
+                    try {
+                        m.setAccessible(true);
+                        m.invoke(view, text, false);
+                        logD("invokeTextSetter(2-arg) succeeded via " + cls.getSimpleName() + "." + m.getName());
+                        return;
+                    } catch (Throwable t) {
+                        logE("invokeTextSetter failed on " + m.getName(), t);
+                    }
+                }
+            }
+        }
+        for (Class<?> cls = view.getClass(); cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
+            for (Method m : cls.getDeclaredMethods()) {
+                Class<?>[] params = m.getParameterTypes();
+                Class<?> ret = m.getReturnType();
+                if (params.length == 1 && params[0] == CharSequence.class
+                        && (ret == boolean.class || ret == void.class)) {
+                    try {
+                        m.setAccessible(true);
+                        m.invoke(view, text);
+                        logD("invokeTextSetter(1-arg) succeeded via " + cls.getSimpleName() + "." + m.getName());
+                        return;
+                    } catch (Throwable t) {
+                        logE("invokeTextSetter failed on " + m.getName(), t);
+                    }
                 }
             }
         }
@@ -246,7 +261,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         Class<?> userCls = XposedHelpers.findClassIfExists("org.telegram.tgnet.TLRPC$User", cl);
         if (userCls == null) {
-            logE("TLRPC$User class not found", null);
             return null;
         }
         for (Method m : messagesController.getClass().getMethods()) {
@@ -256,16 +270,26 @@ public class MainHook implements IXposedHookLoadPackage {
                     && userCls.isAssignableFrom(m.getReturnType())) {
                 try {
                     Object res = m.invoke(messagesController, userId);
-                    logD("findUserById tried " + m.getName() + "(" + params[0].getSimpleName() + ") -> " + res);
                     if (res != null) {
                         return res;
                     }
-                } catch (Throwable t) {
-                    logE("findUserById error invoking " + m.getName(), t);
+                } catch (Throwable ignored) {
                 }
             }
         }
         return null;
+    }
+
+    private static String extractStringField(Object obj, String fieldName) {
+        if (obj == null) {
+            return null;
+        }
+        try {
+            Object val = XposedHelpers.getObjectField(obj, fieldName);
+            return val instanceof String ? (String) val : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static int extractDcId(Object user) {
@@ -275,7 +299,6 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Object photo = XposedHelpers.getObjectField(user, "photo");
             if (photo == null) {
-                logD("extractDcId: user.photo is null");
                 return 0;
             }
             int dcId = XposedHelpers.getIntField(photo, "dc_id");
@@ -286,8 +309,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (photoBig != null) {
                 return XposedHelpers.getIntField(photoBig, "dc_id");
             }
-        } catch (Throwable t) {
-            logE("extractDcId error", t);
+        } catch (Throwable ignored) {
         }
         return 0;
     }
