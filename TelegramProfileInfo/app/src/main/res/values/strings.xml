@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Telegram Profile Info</string>
+    <string name="xposed_description">Displays each user's Data Center (DC) and User ID right under their profile picture in Telegram.</string>
+</resources>
