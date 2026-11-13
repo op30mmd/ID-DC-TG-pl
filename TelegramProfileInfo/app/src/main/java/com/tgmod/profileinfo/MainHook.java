@@ -3,9 +3,15 @@ package com.tgmod.profileinfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorFilter;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.util.Log;
@@ -16,6 +22,7 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
 import android.widget.TextView;
@@ -38,7 +45,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Obfuscation-immune LSPosed module that displays a clean "ID: <id>, DC: <dc>"
  * line right under the profile status/avatar in ProfileActivity for both users
- * and supergroups/channels, with a clean tap-to-copy popup menu.
+ * and supergroups/channels, with a Telegram-styled popup menu (Copy, Copy Link, Copy ID & DC).
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -111,12 +118,14 @@ public class MainHook implements IXposedHookLoadPackage {
             Object messagesController = XposedHelpers.callMethod(profileActivity, "getMessagesController");
             int dcId;
             String displayId;
+            String deepLink;
             String titleOrFirstName;
 
             if (userId != 0L) {
                 Object user = findEntityById(messagesController, userId, "org.telegram.tgnet.TLRPC$User", cl);
                 dcId = extractDcId(user);
                 displayId = String.valueOf(userId);
+                deepLink = "tg://openmessage?user_id=" + userId;
                 titleOrFirstName = extractStringField(user, "first_name");
             } else {
                 Object chat = findEntityById(messagesController, chatId, "org.telegram.tgnet.TLRPC$Chat", cl);
@@ -124,6 +133,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 boolean isChannelOrSupergroup = chat != null
                         && chat.getClass().getSimpleName().toLowerCase().contains("channel");
                 displayId = isChannelOrSupergroup ? ("-100" + chatId) : String.valueOf(chatId);
+                deepLink = "tg://openmessage?chat_id=" + chatId;
                 titleOrFirstName = extractStringField(chat, "title");
             }
 
@@ -154,13 +164,11 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             if (statusView == null) {
-                logD("No statusView found for id=" + displayId);
                 return;
             }
 
             ViewParent parent = statusView.getParent();
             if (!(parent instanceof ViewGroup)) {
-                logD("statusView parent is not a ViewGroup");
                 return;
             }
 
@@ -178,7 +186,7 @@ public class MainHook implements IXposedHookLoadPackage {
             idDcView.setPadding(dp(context, 8), dp(context, 1), dp(context, 8), dp(context, 2));
             idDcView.setClickable(true);
             idDcView.setFocusable(true);
-            idDcView.setOnClickListener(v -> showCopyPopup(v, displayId, labelText));
+            idDcView.setOnClickListener(v -> showTelegramPopup(profileActivity, v, displayId, deepLink, labelText, dcId > 0, cl));
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -211,26 +219,44 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void showCopyPopup(View anchor, String displayId, String fullLabel) {
+    private static void showTelegramPopup(
+            Object profileActivity,
+            View anchor,
+            String displayId,
+            String deepLink,
+            String fullLabel,
+            boolean hasDc,
+            ClassLoader cl
+    ) {
         Context context = anchor.getContext();
+
+        // Try Telegram's native ItemOptions popup if un-obfuscated in this build
+        if (tryShowNativeItemOptions(profileActivity, anchor, displayId, deepLink, fullLabel, hasDc, cl)) {
+            return;
+        }
+
+        // Fallback: Telegram-styled popup matching ActionBarPopupWindow geometry, icons, and ripple
+        boolean isDark = isDarkTheme(context);
+        int bgColor = isDark ? Color.parseColor("#212429") : Color.WHITE;
+        int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
+        int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
         LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.VERTICAL);
-        int padH = dp(context, 18);
-        int padV = dp(context, 14);
-        card.setPadding(padH, padV, padH, padV);
+        card.setMinimumWidth(dp(context, 210));
+        card.setPadding(0, dp(context, 8), 0, dp(context, 8));
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.parseColor("#1E2229"));
-        bg.setCornerRadius(dp(context, 14));
+        bg.setColor(bgColor);
+        bg.setCornerRadius(dp(context, 12));
         card.setBackground(bg);
 
         TextView header = new TextView(context);
         header.setText(displayId);
-        header.setTextColor(Color.WHITE);
+        header.setTextColor(textColor);
         header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
         header.setTypeface(Typeface.DEFAULT_BOLD);
-        header.setPadding(0, 0, 0, dp(context, 10));
+        header.setPadding(dp(context, 18), dp(context, 8), dp(context, 18), dp(context, 10));
         card.addView(header);
 
         PopupWindow popup = new PopupWindow(
@@ -240,32 +266,151 @@ public class MainHook implements IXposedHookLoadPackage {
                 true
         );
         popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setElevation(dp(context, 10));
+        popup.setElevation(dp(context, 12));
         popup.setOutsideTouchable(true);
 
-        card.addView(buildMenuItem(context, "Copy", v -> {
+        card.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
             copyToClipboard(context, "Telegram ID", displayId);
             popup.dismiss();
         }));
 
-        card.addView(buildMenuItem(context, "Copy ID & DC", v -> {
-            copyToClipboard(context, "Telegram Profile Info", fullLabel);
+        card.addView(buildTelegramRow(context, createLinkIcon(context, iconColor), textColor, "Copy Link", v -> {
+            copyToClipboard(context, "Telegram Link", deepLink);
             popup.dismiss();
         }));
+
+        if (hasDc) {
+            card.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy ID & DC", v -> {
+                copyToClipboard(context, "Telegram Profile Info", fullLabel);
+                popup.dismiss();
+            }));
+        }
 
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
-    private static TextView buildMenuItem(Context context, String label, View.OnClickListener onClick) {
-        TextView item = new TextView(context);
-        item.setText(label);
-        item.setTextColor(Color.parseColor("#E6EDF3"));
-        item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        item.setPadding(0, dp(context, 10), dp(context, 24), dp(context, 10));
-        item.setClickable(true);
-        item.setFocusable(true);
-        item.setOnClickListener(onClick);
-        return item;
+    private static boolean tryShowNativeItemOptions(
+            Object profileActivity,
+            View anchor,
+            String displayId,
+            String deepLink,
+            String fullLabel,
+            boolean hasDc,
+            ClassLoader cl
+    ) {
+        try {
+            Class<?> itemOptionsCls = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
+            if (itemOptionsCls == null) {
+                return false;
+            }
+            Object options = XposedHelpers.callStaticMethod(itemOptionsCls, "makeOptions", profileActivity, anchor);
+            if (options == null) {
+                return false;
+            }
+            Context context = anchor.getContext();
+            XposedHelpers.callMethod(options, "add", 0, "Copy",
+                    (Runnable) () -> copyToClipboard(context, "Telegram ID", displayId));
+            XposedHelpers.callMethod(options, "add", 0, "Copy Link",
+                    (Runnable) () -> copyToClipboard(context, "Telegram Link", deepLink));
+            if (hasDc) {
+                XposedHelpers.callMethod(options, "add", 0, "Copy ID & DC",
+                        (Runnable) () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
+            }
+            XposedHelpers.callMethod(options, "show");
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static LinearLayout buildTelegramRow(
+            Context context,
+            Drawable icon,
+            int textColor,
+            String label,
+            View.OnClickListener onClick
+    ) {
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(context, 18), dp(context, 11), dp(context, 24), dp(context, 11));
+        row.setClickable(true);
+        row.setFocusable(true);
+
+        TypedValue outValue = new TypedValue();
+        if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)) {
+            row.setBackgroundResource(outValue.resourceId);
+        }
+
+        ImageView iv = new ImageView(context);
+        iv.setImageDrawable(icon);
+        LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(dp(context, 22), dp(context, 22));
+        ivLp.rightMargin = dp(context, 18);
+        row.addView(iv, ivLp);
+
+        TextView tv = new TextView(context);
+        tv.setText(label);
+        tv.setTextColor(textColor);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f);
+        row.addView(tv);
+
+        row.setOnClickListener(onClick);
+        return row;
+    }
+
+    private static Drawable createCopyIcon(Context context, int color) {
+        return new Drawable() {
+            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final float s = dp(context, 22) / 24f;
+            {
+                p.setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(1.9f * s);
+                p.setStrokeJoin(Paint.Join.ROUND);
+                p.setStrokeCap(Paint.Cap.ROUND);
+                p.setColor(color);
+            }
+            @Override
+            public void draw(Canvas c) {
+                c.drawRoundRect(new RectF(8 * s, 8 * s, 19 * s, 20 * s), 2 * s, 2 * s, p);
+                c.drawLine(5 * s, 16 * s, 5 * s, 5 * s, p);
+                c.drawLine(5 * s, 5 * s, 15 * s, 5 * s, p);
+            }
+            @Override public void setAlpha(int alpha) { p.setAlpha(alpha); }
+            @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
+            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+        };
+    }
+
+    private static Drawable createLinkIcon(Context context, int color) {
+        return new Drawable() {
+            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final float s = dp(context, 22) / 24f;
+            {
+                p.setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(1.9f * s);
+                p.setStrokeCap(Paint.Cap.ROUND);
+                p.setColor(color);
+            }
+            @Override
+            public void draw(Canvas c) {
+                c.drawArc(new RectF(3 * s, 8 * s, 11 * s, 16 * s), 90, 180, false, p);
+                c.drawLine(7 * s, 8 * s, 10 * s, 8 * s, p);
+                c.drawLine(7 * s, 16 * s, 10 * s, 16 * s, p);
+                c.drawArc(new RectF(13 * s, 8 * s, 21 * s, 16 * s), -90, 180, false, p);
+                c.drawLine(14 * s, 8 * s, 17 * s, 8 * s, p);
+                c.drawLine(14 * s, 16 * s, 17 * s, 16 * s, p);
+                c.drawLine(8.5f * s, 12 * s, 15.5f * s, 12 * s, p);
+            }
+            @Override public void setAlpha(int alpha) { p.setAlpha(alpha); }
+            @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
+            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
+        };
+    }
+
+    private static boolean isDarkTheme(Context context) {
+        int nightMask = context.getResources().getConfiguration().uiMode
+                & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
+        return nightMask == android.content.res.Configuration.UI_MODE_NIGHT_YES;
     }
 
     private static void copyToClipboard(Context context, String label, String text) {
