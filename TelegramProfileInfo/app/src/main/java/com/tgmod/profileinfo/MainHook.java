@@ -3,22 +3,31 @@ package com.tgmod.profileinfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.text.SpannableStringBuilder;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.view.ViewTreeObserver;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.PopupWindow;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -27,9 +36,9 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Obfuscation-immune LSPosed module that displays Data Center (DC) and ID
- * right under profile pictures in ProfileActivity for both users and
- * groups/supergroups/channels, with tap/long-press to copy.
+ * Obfuscation-immune LSPosed module that displays a clean "ID: <id>, DC: <dc>"
+ * line right under the profile status/avatar in ProfileActivity for both users
+ * and supergroups/channels, with a clean tap-to-copy popup menu.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -41,12 +50,6 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.web",
             "org.telegram.messenger.beta"
     ));
-
-    // value: [0] = badge (" · DC 4 · ID 123"), [1] = raw ID ("123"), [2] = full info ("DC 4 · ID 123")
-    private final Map<View, String[]> viewInfoMap =
-            Collections.synchronizedMap(new WeakHashMap<View, String[]>());
-    private final Set<Class<?>> hookedTextClasses =
-            Collections.synchronizedSet(new HashSet<Class<?>>());
 
     private static void logD(String msg) {
         XposedBridge.log(TAG + msg);
@@ -67,8 +70,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        logD("handleLoadPackage: pkg=" + lpparam.packageName + ", proc=" + lpparam.processName);
-
         ClassLoader cl = lpparam.classLoader;
         Class<?> profileActivityCls = XposedHelpers.findClassIfExists("org.telegram.ui.ProfileActivity", cl);
         if (profileActivityCls == null) {
@@ -84,17 +85,17 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            attachProfileInfo(param.thisObject, cl);
+                            attachProfileInfo(param.thisObject, (Context) param.args[0], cl);
                         }
                     }
             );
-            logD("Successfully hooked ProfileActivity.createView(Context)");
+            logD("Hooked ProfileActivity.createView(Context)");
         } catch (Throwable t) {
             logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
     }
 
-    private void attachProfileInfo(Object profileActivity, ClassLoader cl) {
+    private void attachProfileInfo(Object profileActivity, Context context, ClassLoader cl) {
         try {
             Bundle args = (Bundle) XposedHelpers.callMethod(profileActivity, "getArguments");
             if (args == null) {
@@ -126,12 +127,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 titleOrFirstName = extractStringField(chat, "title");
             }
 
-            String fullInfo = dcId > 0
-                    ? "DC " + dcId + " · ID " + displayId
-                    : "ID " + displayId;
-            String badge = " · " + fullInfo;
-            String[] infoTuple = new String[]{badge, displayId, fullInfo};
-
             List<View> candidates = new ArrayList<>();
             for (Field field : profileActivity.getClass().getDeclaredFields()) {
                 Class<?> fType = field.getType();
@@ -148,36 +143,129 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
 
-            logD("attachProfileInfo: id=" + displayId + ", dcId=" + dcId + ", candidates=" + candidates.size());
-
+            View statusView = null;
             for (View view : candidates) {
                 CharSequence existing = getCurrentText(view);
                 if (candidates.size() > 1 && titleOrFirstName != null && !titleOrFirstName.isEmpty()
                         && existing != null && existing.toString().startsWith(titleOrFirstName)) {
                     continue;
                 }
-
-                hookSimpleTextViewHierarchy(view.getClass());
-                viewInfoMap.put(view, infoTuple);
-                attachCopyListeners(view, displayId, fullInfo);
-
-                if (existing != null && !existing.toString().contains("ID " + displayId)) {
-                    invokeTextSetter(view, appendBadge(existing, badge));
-                }
+                statusView = view;
             }
+
+            if (statusView == null) {
+                logD("No statusView found for id=" + displayId);
+                return;
+            }
+
+            ViewParent parent = statusView.getParent();
+            if (!(parent instanceof ViewGroup)) {
+                logD("statusView parent is not a ViewGroup");
+                return;
+            }
+
+            ViewGroup container = (ViewGroup) parent;
+            String labelText = dcId > 0
+                    ? ("ID: " + displayId + ", DC: " + dcId)
+                    : ("ID: " + displayId);
+
+            TextView idDcView = new TextView(context);
+            idDcView.setText(labelText);
+            idDcView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            idDcView.setTextColor(Color.parseColor("#9AA0A6"));
+            idDcView.setSingleLine(true);
+            idDcView.setGravity(Gravity.CENTER_HORIZONTAL);
+            idDcView.setPadding(dp(context, 8), dp(context, 1), dp(context, 8), dp(context, 2));
+            idDcView.setClickable(true);
+            idDcView.setFocusable(true);
+            idDcView.setOnClickListener(v -> showCopyPopup(v, displayId, labelText));
+
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP | Gravity.LEFT
+            );
+            container.addView(idDcView, lp);
+
+            final View anchor = statusView;
+            final int yOffset = dp(context, 2);
+            ViewTreeObserver.OnPreDrawListener syncListener = () -> {
+                if (anchor.getVisibility() != View.VISIBLE || anchor.getAlpha() <= 0.05f) {
+                    idDcView.setVisibility(View.GONE);
+                } else {
+                    idDcView.setVisibility(View.VISIBLE);
+                    float centerX = anchor.getX() + (anchor.getWidth() - idDcView.getWidth()) / 2f;
+                    idDcView.setX(Math.max(0f, centerX));
+                    idDcView.setY(anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset);
+                    idDcView.setAlpha(anchor.getAlpha());
+                    idDcView.setScaleX(anchor.getScaleX());
+                    idDcView.setScaleY(anchor.getScaleY());
+                }
+                return true;
+            };
+            anchor.getViewTreeObserver().addOnPreDrawListener(syncListener);
+
+            logD("Injected idDcView: '" + labelText + "'");
         } catch (Throwable t) {
             logE("attachProfileInfo error", t);
         }
     }
 
-    private static void attachCopyListeners(View view, String displayId, String fullInfo) {
-        view.setClickable(true);
-        view.setLongClickable(true);
-        view.setOnClickListener(v -> copyToClipboard(v.getContext(), "Telegram ID", displayId));
-        view.setOnLongClickListener(v -> {
-            copyToClipboard(v.getContext(), "Telegram Profile Info", fullInfo);
-            return true;
-        });
+    private static void showCopyPopup(View anchor, String displayId, String fullLabel) {
+        Context context = anchor.getContext();
+
+        LinearLayout card = new LinearLayout(context);
+        card.setOrientation(LinearLayout.VERTICAL);
+        int padH = dp(context, 18);
+        int padV = dp(context, 14);
+        card.setPadding(padH, padV, padH, padV);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#1E2229"));
+        bg.setCornerRadius(dp(context, 14));
+        card.setBackground(bg);
+
+        TextView header = new TextView(context);
+        header.setText(displayId);
+        header.setTextColor(Color.WHITE);
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setPadding(0, 0, 0, dp(context, 10));
+        card.addView(header);
+
+        PopupWindow popup = new PopupWindow(
+                card,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                true
+        );
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setElevation(dp(context, 10));
+        popup.setOutsideTouchable(true);
+
+        card.addView(buildMenuItem(context, "Copy", v -> {
+            copyToClipboard(context, "Telegram ID", displayId);
+            popup.dismiss();
+        }));
+
+        card.addView(buildMenuItem(context, "Copy ID & DC", v -> {
+            copyToClipboard(context, "Telegram Profile Info", fullLabel);
+            popup.dismiss();
+        }));
+
+        popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
+    }
+
+    private static TextView buildMenuItem(Context context, String label, View.OnClickListener onClick) {
+        TextView item = new TextView(context);
+        item.setText(label);
+        item.setTextColor(Color.parseColor("#E6EDF3"));
+        item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        item.setPadding(0, dp(context, 10), dp(context, 24), dp(context, 10));
+        item.setClickable(true);
+        item.setFocusable(true);
+        item.setOnClickListener(onClick);
+        return item;
     }
 
     private static void copyToClipboard(Context context, String label, String text) {
@@ -192,55 +280,9 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void hookSimpleTextViewHierarchy(Class<?> leafCls) {
-        for (Class<?> cls = leafCls; cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
-            if (!hookedTextClasses.add(cls)) {
-                continue;
-            }
-            for (Method m : cls.getDeclaredMethods()) {
-                if (isTextSetterMethod(m)) {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!(param.thisObject instanceof View)) {
-                                return;
-                            }
-                            View view = (View) param.thisObject;
-                            String[] info = viewInfoMap.get(view);
-                            if (info == null) {
-                                return;
-                            }
-                            String badge = info[0];
-                            CharSequence text = (CharSequence) param.args[0];
-                            if (text != null && !text.toString().contains(badge)) {
-                                param.args[0] = appendBadge(text, badge);
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
-
-    private static boolean isTextSetterMethod(Method m) {
-        Class<?>[] params = m.getParameterTypes();
-        Class<?> ret = m.getReturnType();
-        if (ret != boolean.class && ret != void.class) {
-            return false;
-        }
-        if (params.length == 2 && params[0] == CharSequence.class && params[1] == boolean.class) {
-            return true;
-        }
-        return params.length == 1 && params[0] == CharSequence.class;
-    }
-
-    private static CharSequence appendBadge(CharSequence base, String badge) {
-        if (base instanceof SpannableStringBuilder) {
-            SpannableStringBuilder ssb = new SpannableStringBuilder(base);
-            ssb.append(badge);
-            return ssb;
-        }
-        return base + badge;
+    private static int dp(Context context, float dp) {
+        return Math.round(TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, dp, context.getResources().getDisplayMetrics()));
     }
 
     private static CharSequence getCurrentText(View view) {
@@ -250,41 +292,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return res instanceof CharSequence ? (CharSequence) res : null;
         } catch (Throwable ignored) {
             return null;
-        }
-    }
-
-    private static void invokeTextSetter(View view, CharSequence text) {
-        for (Class<?> cls = view.getClass(); cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
-            for (Method m : cls.getDeclaredMethods()) {
-                Class<?>[] params = m.getParameterTypes();
-                Class<?> ret = m.getReturnType();
-                if (params.length == 2 && params[0] == CharSequence.class && params[1] == boolean.class
-                        && (ret == boolean.class || ret == void.class)) {
-                    try {
-                        m.setAccessible(true);
-                        m.invoke(view, text, false);
-                        return;
-                    } catch (Throwable t) {
-                        logE("invokeTextSetter failed on " + m.getName(), t);
-                    }
-                }
-            }
-        }
-        for (Class<?> cls = view.getClass(); cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
-            for (Method m : cls.getDeclaredMethods()) {
-                Class<?>[] params = m.getParameterTypes();
-                Class<?> ret = m.getReturnType();
-                if (params.length == 1 && params[0] == CharSequence.class
-                        && (ret == boolean.class || ret == void.class)) {
-                    try {
-                        m.setAccessible(true);
-                        m.invoke(view, text);
-                        return;
-                    } catch (Throwable t) {
-                        logE("invokeTextSetter failed on " + m.getName(), t);
-                    }
-                }
-            }
         }
     }
 
