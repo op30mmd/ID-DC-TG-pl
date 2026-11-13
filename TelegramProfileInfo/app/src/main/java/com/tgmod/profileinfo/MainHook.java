@@ -406,9 +406,11 @@ public class MainHook implements IXposedHookLoadPackage {
             int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
             int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
-            try {
-                XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
-            } catch (Throwable ignored) {
+            if (resProvider == null) {
+                try {
+                    XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
+                } catch (Throwable ignored) {
+                }
             }
 
             PopupWindow popup = null;
@@ -473,7 +475,25 @@ public class MainHook implements IXposedHookLoadPackage {
                 }));
             }
 
-            popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
+            popup.setClippingEnabled(false);
+            popup.showAsDropDown(anchor, 0, dp(context, 4));
+            try {
+                // Trigger ActionBarPopupWindow's native reveal animation (startAnimation / h)
+                for (Method m : popup.getClass().getDeclaredMethods()) {
+                    if (m.getParameterTypes().length == 0
+                            && m.getReturnType() == void.class
+                            && java.lang.reflect.Modifier.isPublic(m.getModifiers())
+                            && !"dismiss".equals(m.getName())) {
+                        String n = m.getName();
+                        if ("startAnimation".equals(n) || "h".equals(n)) {
+                            m.setAccessible(true);
+                            m.invoke(popup);
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
             logD("Showed native ActionBarPopupWindowLayout popup");
             return true;
         } catch (Throwable t) {
