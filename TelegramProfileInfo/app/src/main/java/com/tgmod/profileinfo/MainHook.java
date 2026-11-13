@@ -58,12 +58,6 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.beta"
     ));
 
-    private static volatile boolean itemOptionsScanned = false;
-    private static volatile Class<?> cachedItemOptionsCls = null;
-    private static volatile Method cachedMakeOptionsMethod = null;
-    private static volatile Method cachedAddItemMethod = null;
-    private static volatile Method cachedShowMethod = null;
-    private static volatile Method cachedAddTextMethod = null;
 
     private static void logD(String msg) {
         XposedBridge.log(TAG + msg);
@@ -104,7 +98,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
             );
             logD("Hooked ProfileActivity.createView(Context)");
-            discoverItemOptionsAsync(cl, profileActivityCls.getSuperclass());
         } catch (Throwable t) {
             logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
@@ -326,143 +319,6 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
-    private static void discoverItemOptionsAsync(ClassLoader cl, Class<?> baseFragmentCls) {
-        if (itemOptionsScanned || baseFragmentCls == null) {
-            return;
-        }
-        new Thread(() -> {
-            try {
-
-                // 1. Fast path: un-obfuscated ItemOptions
-                Class<?> direct = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
-                if (direct != null && matchItemOptionsMethods(direct, baseFragmentCls)) {
-                    logD("discoverItemOptions: matched direct ItemOptions");
-                    return;
-                }
-
-                // 2. Obfuscation-immune scan of org.telegram.ui.Components.* in DEX
-                Object pathList = XposedHelpers.getObjectField(cl, "pathList");
-                Object[] dexElements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
-                long t0 = System.currentTimeMillis();
-                for (Object elem : dexElements) {
-                    Object dexFileObj = XposedHelpers.getObjectField(elem, "dexFile");
-                    if (!(dexFileObj instanceof dalvik.system.DexFile)) {
-                        continue;
-                    }
-                    java.util.Enumeration<String> entries = ((dalvik.system.DexFile) dexFileObj).entries();
-                    while (entries.hasMoreElements()) {
-                        String name = entries.nextElement();
-                        if (!name.startsWith("org.telegram.ui.") || name.contains("$")) {
-                            continue;
-                        }
-                        int lastDot = name.lastIndexOf('.');
-                        String simple = name.substring(lastDot + 1);
-                        if (simple.length() > 6 && !simple.equals("ItemOptions")) {
-                            continue;
-                        }
-                        try {
-                            Class<?> candidate = cl.loadClass(name);
-                            if (matchItemOptionsMethods(candidate, baseFragmentCls)) {
-                                logD("discoverItemOptions: found " + name + " in " + (System.currentTimeMillis() - t0) + "ms");
-                                return;
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-                logD("discoverItemOptions: not found in " + (System.currentTimeMillis() - t0) + "ms");
-            } catch (Throwable t) {
-                logE("discoverItemOptions error", t);
-            } finally {
-                itemOptionsScanned = true;
-            }
-        }, "TG-ProfileInfo-Scan").start();
-    }
-
-    private static boolean isAddItemSignature(Class<?>[] p) {
-        if (p.length == 2 && p[0] == CharSequence.class && p[1] == Runnable.class) {
-            return true;
-        }
-        if (p.length == 3 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class) {
-            return true;
-        }
-        return p.length == 4 && p[0] == int.class && p[1] == CharSequence.class
-                && p[2] == int.class && p[3] == Runnable.class;
-    }
-
-    private static void invokeAddItem(Object options, String text, Runnable action) throws Exception {
-        Class<?>[] p = cachedAddItemMethod.getParameterTypes();
-        if (p.length == 2) {
-            cachedAddItemMethod.invoke(options, text, action);
-        } else if (p.length == 3) {
-            cachedAddItemMethod.invoke(options, 0, text, action);
-        } else if (p.length == 4) {
-            cachedAddItemMethod.invoke(options, 0, text, 0, action);
-        }
-    }
-
-    private static boolean matchItemOptionsMethods(Class<?> cls, Class<?> baseFragmentCls) {
-        Method makeMethod = null;
-        Method addMethod = null;
-        Method showMethod = null;
-        Method addTextMethod = null;
-
-        for (Method m : cls.getDeclaredMethods()) {
-            int mods = m.getModifiers();
-            Class<?>[] p = m.getParameterTypes();
-            Class<?> ret = m.getReturnType();
-
-            if (java.lang.reflect.Modifier.isStatic(mods)
-                    && p.length >= 2
-                    && p[0] == baseFragmentCls
-                    && View.class.isAssignableFrom(p[1])
-                    && ret == cls) {
-                if (makeMethod == null || p.length < makeMethod.getParameterTypes().length) {
-                    makeMethod = m;
-                }
-            } else if (!java.lang.reflect.Modifier.isStatic(mods)
-                    && ret == cls
-                    && isAddItemSignature(p)) {
-                if (addMethod == null || p.length == 3) {
-                    addMethod = m;
-                }
-            } else if (!java.lang.reflect.Modifier.isStatic(mods)
-                    && p.length == 0
-                    && (ret == cls || ret == void.class)
-                    && (m.getName().equals("show") || m.getName().length() <= 3)) {
-                if (showMethod == null || m.getName().equals("show") || (ret == cls && showMethod.getReturnType() != cls)) {
-                    showMethod = m;
-                }
-            } else if (!java.lang.reflect.Modifier.isStatic(mods)
-                    && p.length == 2
-                    && p[0] == CharSequence.class
-                    && p[1] == int.class
-                    && ret == cls) {
-                addTextMethod = m;
-            }
-        }
-
-        if (addMethod != null && makeMethod == null) {
-            logD("ItemOptions candidate " + cls.getName() + " had add(int,CharSequence,Runnable) but no makeOptions(BaseFragment,View,...)");
-        }
-
-        if (makeMethod != null && addMethod != null && showMethod != null) {
-            makeMethod.setAccessible(true);
-            addMethod.setAccessible(true);
-            showMethod.setAccessible(true);
-            if (addTextMethod != null) {
-                addTextMethod.setAccessible(true);
-            }
-            cachedItemOptionsCls = cls;
-            cachedMakeOptionsMethod = makeMethod;
-            cachedAddItemMethod = addMethod;
-            cachedShowMethod = showMethod;
-            cachedAddTextMethod = addTextMethod;
-            return true;
-        }
-        return false;
-    }
-
     private static boolean tryShowNativeItemOptions(
             Object profileActivity,
             View anchor,
@@ -472,43 +328,101 @@ public class MainHook implements IXposedHookLoadPackage {
             boolean hasDc,
             ClassLoader cl
     ) {
-        if (cachedItemOptionsCls == null || cachedMakeOptionsMethod == null
-                || cachedAddItemMethod == null || cachedShowMethod == null) {
-            logD("tryShowNativeItemOptions: native ItemOptions not cached yet (scanned=" + itemOptionsScanned + ")");
-            return false;
-        }
         try {
-            Class<?>[] makeParams = cachedMakeOptionsMethod.getParameterTypes();
-            Object[] makeArgs = new Object[makeParams.length];
-            makeArgs[0] = profileActivity;
-            makeArgs[1] = anchor;
-            for (int i = 2; i < makeParams.length; i++) {
-                if (makeParams[i] == boolean.class) makeArgs[i] = false;
-                else if (makeParams[i] == int.class) makeArgs[i] = 0;
-                else makeArgs[i] = null;
-            }
-            Object options = cachedMakeOptionsMethod.invoke(null, makeArgs);
-            if (options == null) {
-                logD("tryShowNativeItemOptions: makeOptions returned null");
+            Class<?> layoutCls = XposedHelpers.findClassIfExists(
+                    "org.telegram.ui.ActionBar.ActionBarPopupWindow$ActionBarPopupWindowLayout", cl);
+            if (layoutCls == null) {
+                logD("ActionBarPopupWindowLayout not found");
                 return false;
             }
             Context context = anchor.getContext();
-            if (cachedAddTextMethod != null) {
+            Object resProvider = null;
+            try {
+                resProvider = XposedHelpers.callMethod(profileActivity, "getResourceProvider");
+            } catch (Throwable ignored) {
+            }
+
+            ViewGroup popupLayout = null;
+            try {
+                popupLayout = (ViewGroup) XposedHelpers.newInstance(layoutCls, context, resProvider);
+            } catch (Throwable ignored) {
                 try {
-                    cachedAddTextMethod.invoke(options, displayId, 15);
+                    popupLayout = (ViewGroup) XposedHelpers.newInstance(layoutCls, context);
+                } catch (Throwable ignored2) {
+                }
+            }
+            if (popupLayout == null) {
+                logD("Could not instantiate ActionBarPopupWindowLayout");
+                return false;
+            }
+
+            int bgColor = resolvePopupBackgroundColor(profileActivity, context, anchor);
+            boolean isDark = isColorDark(bgColor);
+            int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
+            int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
+
+            try {
+                XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
+            } catch (Throwable ignored) {
+            }
+
+            PopupWindow popup = null;
+            Class<?> popupCls = layoutCls.getEnclosingClass();
+            if (popupCls != null && PopupWindow.class.isAssignableFrom(popupCls)) {
+                try {
+                    popup = (PopupWindow) XposedHelpers.newInstance(
+                            popupCls,
+                            popupLayout,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                    );
                 } catch (Throwable ignored) {
                 }
             }
-            invokeAddItem(options, "Copy", () -> copyToClipboard(context, "Telegram ID", displayId));
-            invokeAddItem(options, "Copy Link", () -> copyToClipboard(context, "Telegram Link", deepLink));
-            if (hasDc) {
-                invokeAddItem(options, "Copy ID & DC", () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
+            if (popup == null) {
+                popup = new PopupWindow(
+                        popupLayout,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        true
+                );
+                popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
             }
-            cachedShowMethod.invoke(options);
-            logD("tryShowNativeItemOptions: showed native ItemOptions (" + cachedItemOptionsCls.getName() + ")");
+            popup.setFocusable(true);
+            popup.setOutsideTouchable(true);
+
+            final PopupWindow finalPopup = popup;
+
+            TextView header = new TextView(context);
+            header.setText(displayId);
+            header.setTextColor(textColor);
+            header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+            header.setTypeface(Typeface.DEFAULT_BOLD);
+            header.setPadding(dp(context, 18), dp(context, 10), dp(context, 18), dp(context, 10));
+            popupLayout.addView(header);
+
+            popupLayout.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
+                copyToClipboard(context, "Telegram ID", displayId);
+                finalPopup.dismiss();
+            }));
+
+            popupLayout.addView(buildTelegramRow(context, createLinkIcon(context, iconColor), textColor, "Copy Link", v -> {
+                copyToClipboard(context, "Telegram Link", deepLink);
+                finalPopup.dismiss();
+            }));
+
+            if (hasDc) {
+                popupLayout.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy ID & DC", v -> {
+                    copyToClipboard(context, "Telegram Profile Info", fullLabel);
+                    finalPopup.dismiss();
+                }));
+            }
+
+            popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
+            logD("Showed native ActionBarPopupWindowLayout popup");
             return true;
         } catch (Throwable t) {
-            logE("tryShowNativeItemOptions failed; falling back to Telegram-styled popup", t);
+            logE("tryShowNativeItemOptions failed", t);
             return false;
         }
     }
