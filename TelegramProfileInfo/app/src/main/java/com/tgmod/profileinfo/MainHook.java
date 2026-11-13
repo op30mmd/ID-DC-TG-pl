@@ -189,10 +189,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         CharSequence text = (CharSequence) param.args[0];
                         logD("Text setter fired on " + view.getClass().getSimpleName()
                                 + " tag=" + view.getTag()
-                                + " text="" + text + """);
+                                + " text='" + text + "'");
                         if (text != null && !text.toString().contains(badge)) {
                             param.args[0] = appendBadge(text, badge);
-                            logD("Appended badge -> "" + param.args[0] + """);
+                            logD("Appended badge -> '" + param.args[0] + "'");
                         }
                     }
                 });
