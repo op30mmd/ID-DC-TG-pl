@@ -352,11 +352,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     java.util.Enumeration<String> entries = ((dalvik.system.DexFile) dexFileObj).entries();
                     while (entries.hasMoreElements()) {
                         String name = entries.nextElement();
-                        if (!name.startsWith("org.telegram.ui.Components.") || name.contains("$")) {
+                        if (!name.startsWith("org.telegram.ui.") || name.contains("$")) {
                             continue;
                         }
-                        // R8-renamed classes in Components are short (e.g. org.telegram.ui.Components.s5)
-                        String simple = name.substring("org.telegram.ui.Components.".length());
+                        int lastDot = name.lastIndexOf('.');
+                        String simple = name.substring(lastDot + 1);
                         if (simple.length() > 6 && !simple.equals("ItemOptions")) {
                             continue;
                         }
@@ -379,6 +379,28 @@ public class MainHook implements IXposedHookLoadPackage {
         }, "TG-ProfileInfo-Scan").start();
     }
 
+    private static boolean isAddItemSignature(Class<?>[] p) {
+        if (p.length == 2 && p[0] == CharSequence.class && p[1] == Runnable.class) {
+            return true;
+        }
+        if (p.length == 3 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class) {
+            return true;
+        }
+        return p.length == 4 && p[0] == int.class && p[1] == CharSequence.class
+                && p[2] == int.class && p[3] == Runnable.class;
+    }
+
+    private static void invokeAddItem(Object options, String text, Runnable action) throws Exception {
+        Class<?>[] p = cachedAddItemMethod.getParameterTypes();
+        if (p.length == 2) {
+            cachedAddItemMethod.invoke(options, text, action);
+        } else if (p.length == 3) {
+            cachedAddItemMethod.invoke(options, 0, text, action);
+        } else if (p.length == 4) {
+            cachedAddItemMethod.invoke(options, 0, text, 0, action);
+        }
+    }
+
     private static boolean matchItemOptionsMethods(Class<?> cls, Class<?> baseFragmentCls) {
         Method makeMethod = null;
         Method addMethod = null;
@@ -399,12 +421,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     makeMethod = m;
                 }
             } else if (!java.lang.reflect.Modifier.isStatic(mods)
-                    && p.length == 3
-                    && p[0] == int.class
-                    && p[1] == CharSequence.class
-                    && p[2] == Runnable.class
-                    && ret == cls) {
-                addMethod = m;
+                    && ret == cls
+                    && isAddItemSignature(p)) {
+                if (addMethod == null || p.length == 3) {
+                    addMethod = m;
+                }
             } else if (!java.lang.reflect.Modifier.isStatic(mods)
                     && p.length == 0
                     && (ret == cls || ret == void.class)
@@ -478,13 +499,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 } catch (Throwable ignored) {
                 }
             }
-            cachedAddItemMethod.invoke(options, 0, "Copy",
-                    (Runnable) () -> copyToClipboard(context, "Telegram ID", displayId));
-            cachedAddItemMethod.invoke(options, 0, "Copy Link",
-                    (Runnable) () -> copyToClipboard(context, "Telegram Link", deepLink));
+            invokeAddItem(options, "Copy", () -> copyToClipboard(context, "Telegram ID", displayId));
+            invokeAddItem(options, "Copy Link", () -> copyToClipboard(context, "Telegram Link", deepLink));
             if (hasDc) {
-                cachedAddItemMethod.invoke(options, 0, "Copy ID & DC",
-                        (Runnable) () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
+                invokeAddItem(options, "Copy ID & DC", () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
             }
             cachedShowMethod.invoke(options);
             logD("tryShowNativeItemOptions: showed native ItemOptions (" + cachedItemOptionsCls.getName() + ")");
