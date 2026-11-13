@@ -37,7 +37,7 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Build Debug & Unsigned Release APKs
+      - name: Build Debug & Test-Signed Release APKs
         run: gradle assembleDebug assembleRelease --no-daemon
 
       - name: Upload Debug APK
@@ -46,8 +46,8 @@ jobs:
           name: TelegramProfileInfo-debug-apk
           path: TelegramProfileInfo/app/build/outputs/apk/debug/*.apk
 
-      - name: Upload Release APK (unsigned)
+      - name: Upload Release APK (test-signed)
         uses: actions/upload-artifact@v4
         with:
-          name: TelegramProfileInfo-release-unsigned-apk
+          name: TelegramProfileInfo-release-test-signed-apk
           path: TelegramProfileInfo/app/build/outputs/apk/release/*.apk
