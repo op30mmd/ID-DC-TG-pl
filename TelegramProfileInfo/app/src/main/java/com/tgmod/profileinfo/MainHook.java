@@ -202,20 +202,25 @@ public class MainHook implements IXposedHookLoadPackage {
             idDcView.bringToFront();
             final View anchor = statusView;
             final int yOffset = -dp(context, 2);
+            final float minLeftMargin = dp(context, 16);
             final float centerTolerance = dp(context, 24);
+            final int[] anchorLoc = new int[2];
+            final int[] containerLoc = new int[2];
             final boolean[] loggedOnce = new boolean[]{false};
             ViewTreeObserver.OnPreDrawListener syncListener = () -> {
                 boolean visible = anchor.getVisibility() == View.VISIBLE && anchor.getAlpha() > 0.05f;
                 idDcView.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
                 idDcView.setClickable(visible);
                 if (visible) {
-                    float anchorX = anchor.getX();
+                    anchor.getLocationInWindow(anchorLoc);
+                    container.getLocationInWindow(containerLoc);
+                    float anchorVisualX = (anchorLoc[0] - containerLoc[0]) + anchor.getPaddingLeft();
                     float anchorTextW = getAnchorTextWidth(anchor);
-                    float anchorMid = anchorX + anchorTextW / 2f;
+                    float anchorMid = anchorVisualX + anchorTextW / 2f;
                     float containerMid = container.getWidth() / 2f;
                     boolean isLeftAligned = Math.abs(anchorMid - containerMid) > centerTolerance;
                     float targetX = isLeftAligned
-                            ? (anchorX + anchor.getPaddingLeft())
+                            ? Math.max(minLeftMargin, anchorVisualX)
                             : ((container.getWidth() - idDcView.getWidth()) / 2f);
                     float targetY = anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset;
                     idDcView.setX(Math.max(0f, targetX));
@@ -226,9 +231,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     idDcView.setScaleY(anchor.getScaleY());
                     if (!loggedOnce[0] && container.getWidth() > 0 && idDcView.getWidth() > 0) {
                         loggedOnce[0] = true;
-                        logD("Layout sync: anchorX=" + anchorX + ", anchorY=" + anchor.getY()
-                                + ", anchorH=" + anchor.getHeight() + ", textW=" + anchorTextW
-                                + ", containerW=" + container.getWidth() + ", idDcW=" + idDcView.getWidth()
+                        logD("Layout sync: visualX=" + anchorVisualX + ", anchorX=" + anchor.getX()
+                                + ", textW=" + anchorTextW + ", containerW=" + container.getWidth()
                                 + ", isLeft=" + isLeftAligned + ", targetX=" + targetX + ", targetY=" + targetY);
                     }
                 }
