@@ -3,6 +3,7 @@ package com.tgmod.profileinfo;
 import android.content.Context;
 import android.os.Bundle;
 import android.text.SpannableStringBuilder;
+import android.util.Log;
 import android.view.View;
 
 import java.lang.reflect.Field;
@@ -23,16 +24,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Obfuscation-immune LSPosed module that displays a user's Data Center (DC)
  * and User ID right under their profile picture in ProfileActivity.
  *
- * Uses un-obfuscated anchors:
- *   - org.telegram.ui.ProfileActivity (kept by R8)
- *   - BaseFragment.getArguments() -> Bundle key "user_id"
- *   - BaseFragment.getMessagesController() -> method (Long) -> TLRPC$User
- *   - TLRPC$User.id, TLRPC$User.photo.dc_id (TL schema fields, never obfuscated)
- *   - Dynamic discovery of the SimpleTextView status field (onlineTextView)
- *     via its un-obfuscated setRightDrawableInside(boolean) method.
+ * Includes verbose debug logging to both LSPosed Logs (XposedBridge.log)
+ * and Android logcat (tag: TG-ProfileInfo).
  */
 public class MainHook implements IXposedHookLoadPackage {
 
+    private static final String LOG_TAG = "TG-ProfileInfo";
     private static final String TAG = "[TG-ProfileInfo] ";
 
     private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
@@ -46,19 +43,34 @@ public class MainHook implements IXposedHookLoadPackage {
     private final Set<Class<?>> hookedTextClasses =
             Collections.synchronizedSet(new HashSet<Class<?>>());
 
+    private static void logD(String msg) {
+        XposedBridge.log(TAG + msg);
+        Log.d(LOG_TAG, msg);
+    }
+
+    private static void logE(String msg, Throwable t) {
+        XposedBridge.log(TAG + "ERROR: " + msg);
+        if (t != null) {
+            XposedBridge.log(t);
+        }
+        Log.e(LOG_TAG, msg, t);
+    }
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!TARGET_PACKAGES.contains(lpparam.packageName)) {
             return;
         }
 
+        logD("handleLoadPackage: pkg=" + lpparam.packageName + ", proc=" + lpparam.processName);
+
         ClassLoader cl = lpparam.classLoader;
         Class<?> profileActivityCls = XposedHelpers.findClassIfExists("org.telegram.ui.ProfileActivity", cl);
         if (profileActivityCls == null) {
+            logE("ProfileActivity class NOT found in " + lpparam.packageName, null);
             return;
         }
-
-        XposedBridge.log(TAG + "Hooking ProfileActivity in " + lpparam.packageName);
+        logD("Found ProfileActivity: " + profileActivityCls.getName());
 
         try {
             XposedHelpers.findAndHookMethod(
@@ -68,12 +80,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            logD("ProfileActivity.createView() fired on " + param.thisObject);
                             attachProfileInfo(param.thisObject, cl);
                         }
                     }
             );
+            logD("Successfully hooked ProfileActivity.createView(Context)");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Failed to hook ProfileActivity.createView: " + t.getMessage());
+            logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
     }
 
@@ -81,49 +95,63 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Bundle args = (Bundle) XposedHelpers.callMethod(profileActivity, "getArguments");
             if (args == null) {
+                logD("attachProfileInfo: getArguments() returned null");
                 return;
             }
             long userId = args.getLong("user_id", 0L);
+            logD("attachProfileInfo: user_id=" + userId + ", chat_id=" + args.getLong("chat_id", 0L));
             if (userId == 0L) {
+                logD("attachProfileInfo: skipping (not a user profile)");
                 return;
             }
 
             Object messagesController = XposedHelpers.callMethod(profileActivity, "getMessagesController");
+            logD("attachProfileInfo: messagesController=" + (messagesController != null ? messagesController.getClass().getName() : "null"));
+
             Object user = findUserById(messagesController, userId, cl);
+            logD("attachProfileInfo: resolved user=" + (user != null ? user.getClass().getName() : "null"));
+
             int dcId = extractDcId(user);
+            logD("attachProfileInfo: extracted dc_id=" + dcId);
 
             String badge = dcId > 0
                     ? " · DC " + dcId + " · ID " + userId
                     : " · ID " + userId;
 
-            // Locate SimpleTextView fields on ProfileActivity (e.g., onlineTextView)
-            // by checking for the un-obfuscated setRightDrawableInside(boolean) method.
+            int matchedViews = 0;
             for (Field field : profileActivity.getClass().getDeclaredFields()) {
-                if (!View.class.isAssignableFrom(field.getType())) {
+                Class<?> fType = field.getType();
+                if (!View.class.isAssignableFrom(fType)) {
                     continue;
                 }
-                if (!hasMethod(field.getType(), "setRightDrawableInside", boolean.class)) {
+                boolean hasRightDrawableInside = hasMethod(fType, "setRightDrawableInside", boolean.class);
+                if (!hasRightDrawableInside) {
                     continue;
                 }
                 field.setAccessible(true);
                 Object viewObj = field.get(profileActivity);
+                logD("Candidate SimpleTextView field: " + field.getName()
+                        + " type=" + fType.getName()
+                        + " instance=" + viewObj
+                        + " tag=" + (viewObj instanceof View ? ((View) viewObj).getTag() : "n/a"));
+
                 if (!(viewObj instanceof View)) {
                     continue;
                 }
                 View statusView = (View) viewObj;
-                // onlineTextView carries an Integer theme tag set in updateProfileData()
-                // or is the status SimpleTextView; hook its (CharSequence, boolean) setter.
+                matchedViews++;
                 hookSimpleTextViewClass(statusView.getClass());
                 viewInfoMap.put(statusView, badge);
 
-                // Refresh immediately if text was already populated during createView()
                 CharSequence existing = getCurrentText(statusView);
+                logD("Candidate field " + field.getName() + " existingText=" + existing);
                 if (existing != null && !existing.toString().contains("ID " + userId)) {
                     invokeTextSetter(statusView, appendBadge(existing, badge));
                 }
             }
+            logD("attachProfileInfo: total matched SimpleTextView fields=" + matchedViews);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "attachProfileInfo error: " + t.getMessage());
+            logE("attachProfileInfo error", t);
         }
     }
 
@@ -131,12 +159,22 @@ public class MainHook implements IXposedHookLoadPackage {
         if (!hookedTextClasses.add(cls)) {
             return;
         }
+        logD("Inspecting SimpleTextView class for text setters: " + cls.getName());
+        int hookedCount = 0;
         for (Method m : cls.getDeclaredMethods()) {
             Class<?>[] params = m.getParameterTypes();
-            if (params.length == 2
+            boolean isTwoArgSetter = params.length == 2
                     && params[0] == CharSequence.class
                     && params[1] == boolean.class
-                    && m.getReturnType() == boolean.class) {
+                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class);
+            boolean isOneArgSetter = params.length == 1
+                    && params[0] == CharSequence.class
+                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class);
+
+            if (isTwoArgSetter || isOneArgSetter) {
+                logD("Hooking text setter: " + cls.getSimpleName() + "." + m.getName()
+                        + "(" + Arrays.toString(params) + ") -> " + m.getReturnType().getSimpleName());
+                hookedCount++;
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
@@ -148,19 +186,19 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (badge == null) {
                             return;
                         }
-                        // Only append to the status view (tagged with Integer theme key)
-                        // rather than the display name view.
-                        if (!(view.getTag() instanceof Integer)) {
-                            return;
-                        }
                         CharSequence text = (CharSequence) param.args[0];
+                        logD("Text setter fired on " + view.getClass().getSimpleName()
+                                + " tag=" + view.getTag()
+                                + " text="" + text + """);
                         if (text != null && !text.toString().contains(badge)) {
                             param.args[0] = appendBadge(text, badge);
+                            logD("Appended badge -> "" + param.args[0] + """);
                         }
                     }
                 });
             }
         }
+        logD("Hooked " + hookedCount + " text setter(s) on " + cls.getName());
     }
 
     private static CharSequence appendBadge(CharSequence base, String badge) {
@@ -188,12 +226,14 @@ public class MainHook implements IXposedHookLoadPackage {
             if (params.length == 2
                     && params[0] == CharSequence.class
                     && params[1] == boolean.class
-                    && m.getReturnType() == boolean.class) {
+                    && (m.getReturnType() == boolean.class || m.getReturnType() == void.class)) {
                 try {
                     m.setAccessible(true);
                     m.invoke(view, text, false);
+                    logD("invokeTextSetter succeeded via " + m.getName());
                     return;
-                } catch (Throwable ignored) {
+                } catch (Throwable t) {
+                    logE("invokeTextSetter failed on " + m.getName(), t);
                 }
             }
         }
@@ -205,6 +245,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         Class<?> userCls = XposedHelpers.findClassIfExists("org.telegram.tgnet.TLRPC$User", cl);
         if (userCls == null) {
+            logE("TLRPC$User class not found", null);
             return null;
         }
         for (Method m : messagesController.getClass().getMethods()) {
@@ -214,10 +255,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     && userCls.isAssignableFrom(m.getReturnType())) {
                 try {
                     Object res = m.invoke(messagesController, userId);
+                    logD("findUserById tried " + m.getName() + "(" + params[0].getSimpleName() + ") -> " + res);
                     if (res != null) {
                         return res;
                     }
-                } catch (Throwable ignored) {
+                } catch (Throwable t) {
+                    logE("findUserById error invoking " + m.getName(), t);
                 }
             }
         }
@@ -231,6 +274,7 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Object photo = XposedHelpers.getObjectField(user, "photo");
             if (photo == null) {
+                logD("extractDcId: user.photo is null");
                 return 0;
             }
             int dcId = XposedHelpers.getIntField(photo, "dc_id");
@@ -241,7 +285,8 @@ public class MainHook implements IXposedHookLoadPackage {
             if (photoBig != null) {
                 return XposedHelpers.getIntField(photoBig, "dc_id");
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logE("extractDcId error", t);
         }
         return 0;
     }
