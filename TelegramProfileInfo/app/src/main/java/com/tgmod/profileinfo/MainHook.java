@@ -387,18 +387,17 @@ public class MainHook implements IXposedHookLoadPackage {
 
         for (Method m : cls.getDeclaredMethods()) {
             int mods = m.getModifiers();
-            if (!java.lang.reflect.Modifier.isPublic(mods)) {
-                continue;
-            }
             Class<?>[] p = m.getParameterTypes();
             Class<?> ret = m.getReturnType();
 
             if (java.lang.reflect.Modifier.isStatic(mods)
-                    && p.length == 2
+                    && p.length >= 2
                     && p[0] == baseFragmentCls
-                    && p[1] == View.class
+                    && View.class.isAssignableFrom(p[1])
                     && ret == cls) {
-                makeMethod = m;
+                if (makeMethod == null || p.length < makeMethod.getParameterTypes().length) {
+                    makeMethod = m;
+                }
             } else if (!java.lang.reflect.Modifier.isStatic(mods)
                     && p.length == 3
                     && p[0] == int.class
@@ -408,10 +407,9 @@ public class MainHook implements IXposedHookLoadPackage {
                 addMethod = m;
             } else if (!java.lang.reflect.Modifier.isStatic(mods)
                     && p.length == 0
-                    && ret == cls
+                    && (ret == cls || ret == void.class)
                     && (m.getName().equals("show") || m.getName().length() <= 3)) {
-                // Prefer exact "show" if present, otherwise keep 0-arg Self-returning candidate
-                if (showMethod == null || m.getName().equals("show")) {
+                if (showMethod == null || m.getName().equals("show") || (ret == cls && showMethod.getReturnType() != cls)) {
                     showMethod = m;
                 }
             } else if (!java.lang.reflect.Modifier.isStatic(mods)
@@ -423,7 +421,17 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
 
+        if (addMethod != null && makeMethod == null) {
+            logD("ItemOptions candidate " + cls.getName() + " had add(int,CharSequence,Runnable) but no makeOptions(BaseFragment,View,...)");
+        }
+
         if (makeMethod != null && addMethod != null && showMethod != null) {
+            makeMethod.setAccessible(true);
+            addMethod.setAccessible(true);
+            showMethod.setAccessible(true);
+            if (addTextMethod != null) {
+                addTextMethod.setAccessible(true);
+            }
             cachedItemOptionsCls = cls;
             cachedMakeOptionsMethod = makeMethod;
             cachedAddItemMethod = addMethod;
@@ -449,7 +457,16 @@ public class MainHook implements IXposedHookLoadPackage {
             return false;
         }
         try {
-            Object options = cachedMakeOptionsMethod.invoke(null, profileActivity, anchor);
+            Class<?>[] makeParams = cachedMakeOptionsMethod.getParameterTypes();
+            Object[] makeArgs = new Object[makeParams.length];
+            makeArgs[0] = profileActivity;
+            makeArgs[1] = anchor;
+            for (int i = 2; i < makeParams.length; i++) {
+                if (makeParams[i] == boolean.class) makeArgs[i] = false;
+                else if (makeParams[i] == int.class) makeArgs[i] = 0;
+                else makeArgs[i] = null;
+            }
+            Object options = cachedMakeOptionsMethod.invoke(null, makeArgs);
             if (options == null) {
                 logD("tryShowNativeItemOptions: makeOptions returned null");
                 return false;
