@@ -58,6 +58,13 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.beta"
     ));
 
+    private static volatile boolean itemOptionsScanned = false;
+    private static volatile Class<?> cachedItemOptionsCls = null;
+    private static volatile Method cachedMakeOptionsMethod = null;
+    private static volatile Method cachedAddItemMethod = null;
+    private static volatile Method cachedShowMethod = null;
+    private static volatile Method cachedAddTextMethod = null;
+
     private static void logD(String msg) {
         XposedBridge.log(TAG + msg);
         Log.d(LOG_TAG, msg);
@@ -97,6 +104,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
             );
             logD("Hooked ProfileActivity.createView(Context)");
+            discoverItemOptionsAsync(cl);
         } catch (Throwable t) {
             logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
@@ -318,6 +326,119 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
+    private static void discoverItemOptionsAsync(ClassLoader cl) {
+        if (itemOptionsScanned) {
+            return;
+        }
+        new Thread(() -> {
+            try {
+                Class<?> baseFragmentCls = XposedHelpers.findClassIfExists("org.telegram.ui.ActionBar.BaseFragment", cl);
+                if (baseFragmentCls == null) {
+                    logD("discoverItemOptions: BaseFragment not found");
+                    return;
+                }
+
+                // 1. Fast path: un-obfuscated ItemOptions
+                Class<?> direct = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
+                if (direct != null && matchItemOptionsMethods(direct, baseFragmentCls)) {
+                    logD("discoverItemOptions: matched direct ItemOptions");
+                    return;
+                }
+
+                // 2. Obfuscation-immune scan of org.telegram.ui.Components.* in DEX
+                Object pathList = XposedHelpers.getObjectField(cl, "pathList");
+                Object[] dexElements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
+                long t0 = System.currentTimeMillis();
+                for (Object elem : dexElements) {
+                    Object dexFileObj = XposedHelpers.getObjectField(elem, "dexFile");
+                    if (!(dexFileObj instanceof dalvik.system.DexFile)) {
+                        continue;
+                    }
+                    java.util.Enumeration<String> entries = ((dalvik.system.DexFile) dexFileObj).entries();
+                    while (entries.hasMoreElements()) {
+                        String name = entries.nextElement();
+                        if (!name.startsWith("org.telegram.ui.Components.") || name.contains("$")) {
+                            continue;
+                        }
+                        // R8-renamed classes in Components are short (e.g. org.telegram.ui.Components.s5)
+                        String simple = name.substring("org.telegram.ui.Components.".length());
+                        if (simple.length() > 6 && !simple.equals("ItemOptions")) {
+                            continue;
+                        }
+                        try {
+                            Class<?> candidate = cl.loadClass(name);
+                            if (matchItemOptionsMethods(candidate, baseFragmentCls)) {
+                                logD("discoverItemOptions: found " + name + " in " + (System.currentTimeMillis() - t0) + "ms");
+                                return;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                logD("discoverItemOptions: not found in " + (System.currentTimeMillis() - t0) + "ms");
+            } catch (Throwable t) {
+                logE("discoverItemOptions error", t);
+            } finally {
+                itemOptionsScanned = true;
+            }
+        }, "TG-ProfileInfo-Scan").start();
+    }
+
+    private static boolean matchItemOptionsMethods(Class<?> cls, Class<?> baseFragmentCls) {
+        Method makeMethod = null;
+        Method addMethod = null;
+        Method showMethod = null;
+        Method addTextMethod = null;
+
+        for (Method m : cls.getDeclaredMethods()) {
+            int mods = m.getModifiers();
+            if (!java.lang.reflect.Modifier.isPublic(mods)) {
+                continue;
+            }
+            Class<?>[] p = m.getParameterTypes();
+            Class<?> ret = m.getReturnType();
+
+            if (java.lang.reflect.Modifier.isStatic(mods)
+                    && p.length == 2
+                    && p[0] == baseFragmentCls
+                    && p[1] == View.class
+                    && ret == cls) {
+                makeMethod = m;
+            } else if (!java.lang.reflect.Modifier.isStatic(mods)
+                    && p.length == 3
+                    && p[0] == int.class
+                    && p[1] == CharSequence.class
+                    && p[2] == Runnable.class
+                    && ret == cls) {
+                addMethod = m;
+            } else if (!java.lang.reflect.Modifier.isStatic(mods)
+                    && p.length == 0
+                    && ret == cls
+                    && (m.getName().equals("show") || m.getName().length() <= 3)) {
+                // Prefer exact "show" if present, otherwise keep 0-arg Self-returning candidate
+                if (showMethod == null || m.getName().equals("show")) {
+                    showMethod = m;
+                }
+            } else if (!java.lang.reflect.Modifier.isStatic(mods)
+                    && p.length == 2
+                    && p[0] == CharSequence.class
+                    && p[1] == int.class
+                    && ret == cls) {
+                addTextMethod = m;
+            }
+        }
+
+        if (makeMethod != null && addMethod != null && showMethod != null) {
+            cachedItemOptionsCls = cls;
+            cachedMakeOptionsMethod = makeMethod;
+            cachedAddItemMethod = addMethod;
+            cachedShowMethod = showMethod;
+            cachedAddTextMethod = addTextMethod;
+            return true;
+        }
+        return false;
+    }
+
     private static boolean tryShowNativeItemOptions(
             Object profileActivity,
             View anchor,
@@ -327,28 +448,34 @@ public class MainHook implements IXposedHookLoadPackage {
             boolean hasDc,
             ClassLoader cl
     ) {
+        if (cachedItemOptionsCls == null || cachedMakeOptionsMethod == null
+                || cachedAddItemMethod == null || cachedShowMethod == null) {
+            logD("tryShowNativeItemOptions: native ItemOptions not cached yet (scanned=" + itemOptionsScanned + ")");
+            return false;
+        }
         try {
-            Class<?> itemOptionsCls = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
-            if (itemOptionsCls == null) {
-                logD("tryShowNativeItemOptions: org.telegram.ui.Components.ItemOptions not found (likely R8-renamed); using Telegram-styled fallback");
-                return false;
-            }
-            Object options = XposedHelpers.callStaticMethod(itemOptionsCls, "makeOptions", profileActivity, anchor);
+            Object options = cachedMakeOptionsMethod.invoke(null, profileActivity, anchor);
             if (options == null) {
                 logD("tryShowNativeItemOptions: makeOptions returned null");
                 return false;
             }
             Context context = anchor.getContext();
-            XposedHelpers.callMethod(options, "add", 0, "Copy",
+            if (cachedAddTextMethod != null) {
+                try {
+                    cachedAddTextMethod.invoke(options, displayId, 15);
+                } catch (Throwable ignored) {
+                }
+            }
+            cachedAddItemMethod.invoke(options, 0, "Copy",
                     (Runnable) () -> copyToClipboard(context, "Telegram ID", displayId));
-            XposedHelpers.callMethod(options, "add", 0, "Copy Link",
+            cachedAddItemMethod.invoke(options, 0, "Copy Link",
                     (Runnable) () -> copyToClipboard(context, "Telegram Link", deepLink));
             if (hasDc) {
-                XposedHelpers.callMethod(options, "add", 0, "Copy ID & DC",
+                cachedAddItemMethod.invoke(options, 0, "Copy ID & DC",
                         (Runnable) () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
             }
-            XposedHelpers.callMethod(options, "show");
-            logD("tryShowNativeItemOptions: showed native ItemOptions");
+            cachedShowMethod.invoke(options);
+            logD("tryShowNativeItemOptions: showed native ItemOptions (" + cachedItemOptionsCls.getName() + ")");
             return true;
         } catch (Throwable t) {
             logE("tryShowNativeItemOptions failed; falling back to Telegram-styled popup", t);
