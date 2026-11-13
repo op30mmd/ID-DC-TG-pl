@@ -319,6 +319,42 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
+    private static int resolvePopupDrawableId(Context context) {
+        String[] names = {"popup_fixed_alert4", "popup_fixed_alert3", "popup_fixed_alert2", "popup_fixed_alert"};
+        String pkg = context.getPackageName();
+        for (String name : names) {
+            int id = context.getResources().getIdentifier(name, "drawable", pkg);
+            if (id != 0) {
+                return id;
+            }
+        }
+        return 0;
+    }
+
+    private static ViewGroup instantiatePopupLayout(Class<?> layoutCls, Context context, int resId, Object resProvider) {
+        for (java.lang.reflect.Constructor<?> c : layoutCls.getConstructors()) {
+            Class<?>[] p = c.getParameterTypes();
+            try {
+                if (p.length == 4 && p[0] == int.class && p[1] == int.class
+                        && p[2] == Context.class && resId != 0) {
+                    return (ViewGroup) c.newInstance(resId, 1, context, resProvider);
+                }
+                if (p.length == 3 && p[0] == Context.class && p[1] == int.class) {
+                    return (ViewGroup) c.newInstance(context, resId != 0 ? resId : 0, resProvider);
+                }
+                if (p.length == 2 && p[0] == Context.class) {
+                    return (ViewGroup) c.newInstance(context, resProvider);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            return (ViewGroup) XposedHelpers.newInstance(layoutCls, context);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static boolean tryShowNativeItemOptions(
             Object profileActivity,
             View anchor,
@@ -342,15 +378,8 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {
             }
 
-            ViewGroup popupLayout = null;
-            try {
-                popupLayout = (ViewGroup) XposedHelpers.newInstance(layoutCls, context, resProvider);
-            } catch (Throwable ignored) {
-                try {
-                    popupLayout = (ViewGroup) XposedHelpers.newInstance(layoutCls, context);
-                } catch (Throwable ignored2) {
-                }
-            }
+            int shadowResId = resolvePopupDrawableId(context);
+            ViewGroup popupLayout = instantiatePopupLayout(layoutCls, context, shadowResId, resProvider);
             if (popupLayout == null) {
                 logD("Could not instantiate ActionBarPopupWindowLayout");
                 return false;
@@ -400,6 +429,13 @@ public class MainHook implements IXposedHookLoadPackage {
             header.setTypeface(Typeface.DEFAULT_BOLD);
             header.setPadding(dp(context, 18), dp(context, 10), dp(context, 18), dp(context, 10));
             popupLayout.addView(header);
+
+            View divider = new View(context);
+            divider.setBackgroundColor(isDark ? Color.parseColor("#1FFFFFFF") : Color.parseColor("#14000000"));
+            LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(context, 0.7f)));
+            divLp.bottomMargin = dp(context, 4);
+            popupLayout.addView(divider, divLp);
 
             popupLayout.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
                 copyToClipboard(context, "Telegram ID", displayId);
