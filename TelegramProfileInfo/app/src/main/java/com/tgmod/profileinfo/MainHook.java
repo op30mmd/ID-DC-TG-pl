@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -38,8 +39,8 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.beta"
     ));
 
-    private final WeakHashMap<View, String> viewInfoMap =
-            (WeakHashMap<View, String>) Collections.synchronizedMap(new WeakHashMap<View, String>());
+    private final Map<View, String> viewInfoMap =
+            Collections.synchronizedMap(new WeakHashMap<View, String>());
     private final Set<Class<?>> hookedTextClasses =
             Collections.synchronizedSet(new HashSet<Class<?>>());
 
