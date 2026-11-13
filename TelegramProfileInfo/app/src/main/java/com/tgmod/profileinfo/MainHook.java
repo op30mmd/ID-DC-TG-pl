@@ -198,7 +198,6 @@ public class MainHook implements IXposedHookLoadPackage {
             idDcView.bringToFront();
             final View anchor = statusView;
             final int yOffset = dp(context, 2);
-            final float leftThreshold = dp(context, 28);
             final float centerTolerance = dp(context, 24);
             final boolean[] loggedOnce = new boolean[]{false};
             ViewTreeObserver.OnPreDrawListener syncListener = () -> {
@@ -210,8 +209,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     float anchorTextW = getAnchorTextWidth(anchor);
                     float anchorMid = anchorX + anchorTextW / 2f;
                     float containerMid = container.getWidth() / 2f;
-                    boolean isLeftAligned = anchorX <= leftThreshold
-                            && Math.abs(anchorMid - containerMid) > centerTolerance;
+                    boolean isLeftAligned = Math.abs(anchorMid - containerMid) > centerTolerance;
                     float targetX = isLeftAligned
                             ? (anchorX - idDcView.getPaddingLeft())
                             : ((container.getWidth() - idDcView.getWidth()) / 2f);
