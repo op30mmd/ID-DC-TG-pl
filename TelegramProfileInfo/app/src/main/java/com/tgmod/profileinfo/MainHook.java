@@ -452,10 +452,25 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Method m = view.getClass().getMethod("getTextWidth");
             Object res = m.invoke(view);
-            if (res instanceof Number) {
+            if (res instanceof Number && ((Number) res).floatValue() > 0f) {
                 return ((Number) res).floatValue();
             }
         } catch (Throwable ignored) {
+        }
+        CharSequence text = getCurrentText(view);
+        if (text != null && text.length() > 0) {
+            try {
+                Method getPaint = view.getClass().getMethod("getPaint");
+                Object paint = getPaint.invoke(view);
+                if (paint instanceof android.graphics.Paint) {
+                    return ((android.graphics.Paint) paint).measureText(text, 0, text.length());
+                }
+            } catch (Throwable ignored) {
+            }
+            android.graphics.Paint fallback = new android.graphics.Paint();
+            fallback.setTextSize(TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_SP, 14f, view.getResources().getDisplayMetrics()));
+            return fallback.measureText(text, 0, text.length());
         }
         return view.getWidth();
     }
