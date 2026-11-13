@@ -194,7 +194,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     idDcView.setVisibility(View.GONE);
                 } else {
                     idDcView.setVisibility(View.VISIBLE);
-                    float centerX = anchor.getX() + (anchor.getWidth() - idDcView.getWidth()) / 2f;
+                    float centerX = (container.getWidth() - idDcView.getWidth()) / 2f;
                     idDcView.setX(Math.max(0f, centerX));
                     idDcView.setY(anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset);
                     idDcView.setAlpha(anchor.getAlpha());
