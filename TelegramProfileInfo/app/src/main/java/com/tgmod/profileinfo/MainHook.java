@@ -319,6 +319,22 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
+    private static Class<?> resolveActionBarPopupWindowClass(Class<?> layoutCls) {
+        Class<?> enclosing = layoutCls.getEnclosingClass();
+        if (enclosing != null && PopupWindow.class.isAssignableFrom(enclosing)) {
+            return enclosing;
+        }
+        for (Method m : layoutCls.getMethods()) {
+            if ("setParentWindow".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                Class<?> paramCls = m.getParameterTypes()[0];
+                if (PopupWindow.class.isAssignableFrom(paramCls)) {
+                    return paramCls;
+                }
+            }
+        }
+        return null;
+    }
+
     private static int resolvePopupDrawableId(Context context) {
         String[] names = {"popup_fixed_alert4", "popup_fixed_alert3", "popup_fixed_alert2", "popup_fixed_alert"};
         String pkg = context.getPackageName();
@@ -396,7 +412,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             PopupWindow popup = null;
-            Class<?> popupCls = layoutCls.getEnclosingClass();
+            Class<?> popupCls = resolveActionBarPopupWindowClass(layoutCls);
             if (popupCls != null && PopupWindow.class.isAssignableFrom(popupCls)) {
                 try {
                     popup = (PopupWindow) XposedHelpers.newInstance(
@@ -405,7 +421,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             ViewGroup.LayoutParams.WRAP_CONTENT,
                             ViewGroup.LayoutParams.WRAP_CONTENT
                     );
-                } catch (Throwable ignored) {
+                    XposedHelpers.callMethod(popupLayout, "setParentWindow", popup);
+                    logD("Instantiated native ActionBarPopupWindow: " + popupCls.getName());
+                } catch (Throwable t) {
+                    logE("Failed to instantiate ActionBarPopupWindow " + popupCls.getName(), t);
                 }
             }
             if (popup == null) {
