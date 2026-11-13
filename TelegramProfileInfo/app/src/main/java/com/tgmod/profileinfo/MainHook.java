@@ -1,10 +1,13 @@
 package com.tgmod.profileinfo;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.os.Bundle;
 import android.text.SpannableStringBuilder;
 import android.util.Log;
 import android.view.View;
+import android.widget.Toast;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -26,7 +29,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Obfuscation-immune LSPosed module that displays Data Center (DC) and ID
  * right under profile pictures in ProfileActivity for both users and
- * groups/supergroups/channels.
+ * groups/supergroups/channels, with tap/long-press to copy.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -39,8 +42,9 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.beta"
     ));
 
-    private final Map<View, String> viewInfoMap =
-            Collections.synchronizedMap(new WeakHashMap<View, String>());
+    // value: [0] = badge (" · DC 4 · ID 123"), [1] = raw ID ("123"), [2] = full info ("DC 4 · ID 123")
+    private final Map<View, String[]> viewInfoMap =
+            Collections.synchronizedMap(new WeakHashMap<View, String[]>());
     private final Set<Class<?>> hookedTextClasses =
             Collections.synchronizedSet(new HashSet<Class<?>>());
 
@@ -122,9 +126,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 titleOrFirstName = extractStringField(chat, "title");
             }
 
-            String badge = dcId > 0
-                    ? " · DC " + dcId + " · ID " + displayId
-                    : " · ID " + displayId;
+            String fullInfo = dcId > 0
+                    ? "DC " + dcId + " · ID " + displayId
+                    : "ID " + displayId;
+            String badge = " · " + fullInfo;
+            String[] infoTuple = new String[]{badge, displayId, fullInfo};
 
             List<View> candidates = new ArrayList<>();
             for (Field field : profileActivity.getClass().getDeclaredFields()) {
@@ -148,12 +154,12 @@ public class MainHook implements IXposedHookLoadPackage {
                 CharSequence existing = getCurrentText(view);
                 if (candidates.size() > 1 && titleOrFirstName != null && !titleOrFirstName.isEmpty()
                         && existing != null && existing.toString().startsWith(titleOrFirstName)) {
-                    logD("Skipping title/name view " + view.getClass().getSimpleName() + " ('" + existing + "')");
                     continue;
                 }
 
                 hookSimpleTextViewHierarchy(view.getClass());
-                viewInfoMap.put(view, badge);
+                viewInfoMap.put(view, infoTuple);
+                attachCopyListeners(view, displayId, fullInfo);
 
                 if (existing != null && !existing.toString().contains("ID " + displayId)) {
                     invokeTextSetter(view, appendBadge(existing, badge));
@@ -164,15 +170,35 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private static void attachCopyListeners(View view, String displayId, String fullInfo) {
+        view.setClickable(true);
+        view.setLongClickable(true);
+        view.setOnClickListener(v -> copyToClipboard(v.getContext(), "Telegram ID", displayId));
+        view.setOnLongClickListener(v -> {
+            copyToClipboard(v.getContext(), "Telegram Profile Info", fullInfo);
+            return true;
+        });
+    }
+
+    private static void copyToClipboard(Context context, String label, String text) {
+        try {
+            ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText(label, text));
+                Toast.makeText(context, "Copied: " + text, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Throwable t) {
+            logE("copyToClipboard failed", t);
+        }
+    }
+
     private void hookSimpleTextViewHierarchy(Class<?> leafCls) {
         for (Class<?> cls = leafCls; cls != null && cls != View.class && cls != Object.class; cls = cls.getSuperclass()) {
             if (!hookedTextClasses.add(cls)) {
                 continue;
             }
-            int hookedCount = 0;
             for (Method m : cls.getDeclaredMethods()) {
                 if (isTextSetterMethod(m)) {
-                    hookedCount++;
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
@@ -180,20 +206,19 @@ public class MainHook implements IXposedHookLoadPackage {
                                 return;
                             }
                             View view = (View) param.thisObject;
-                            String badge = viewInfoMap.get(view);
-                            if (badge == null) {
+                            String[] info = viewInfoMap.get(view);
+                            if (info == null) {
                                 return;
                             }
+                            String badge = info[0];
                             CharSequence text = (CharSequence) param.args[0];
                             if (text != null && !text.toString().contains(badge)) {
                                 param.args[0] = appendBadge(text, badge);
-                                logD("Appended badge -> '" + param.args[0] + "'");
                             }
                         }
                     });
                 }
             }
-            logD("Hooked " + hookedCount + " text setter(s) on " + cls.getName());
         }
     }
 
