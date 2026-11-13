@@ -197,13 +197,23 @@ public class MainHook implements IXposedHookLoadPackage {
 
             final View anchor = statusView;
             final int yOffset = dp(context, 2);
+            final float leftThreshold = dp(context, 28);
+            final float centerTolerance = dp(context, 24);
             ViewTreeObserver.OnPreDrawListener syncListener = () -> {
                 if (anchor.getVisibility() != View.VISIBLE || anchor.getAlpha() <= 0.05f) {
                     idDcView.setVisibility(View.GONE);
                 } else {
                     idDcView.setVisibility(View.VISIBLE);
-                    float centerX = (container.getWidth() - idDcView.getWidth()) / 2f;
-                    idDcView.setX(Math.max(0f, centerX));
+                    float anchorX = anchor.getX();
+                    float anchorTextW = getAnchorTextWidth(anchor);
+                    float anchorMid = anchorX + anchorTextW / 2f;
+                    float containerMid = container.getWidth() / 2f;
+                    boolean isLeftAligned = anchorX <= leftThreshold
+                            && Math.abs(anchorMid - containerMid) > centerTolerance;
+                    float targetX = isLeftAligned
+                            ? (anchorX - idDcView.getPaddingLeft())
+                            : ((container.getWidth() - idDcView.getWidth()) / 2f);
+                    idDcView.setX(Math.max(0f, targetX));
                     idDcView.setY(anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset);
                     idDcView.setAlpha(anchor.getAlpha());
                     idDcView.setScaleX(anchor.getScaleX());
@@ -428,6 +438,18 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int dp(Context context, float dp) {
         return Math.round(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP, dp, context.getResources().getDisplayMetrics()));
+    }
+
+    private static float getAnchorTextWidth(View view) {
+        try {
+            Method m = view.getClass().getMethod("getTextWidth");
+            Object res = m.invoke(view);
+            if (res instanceof Number) {
+                return ((Number) res).floatValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return view.getWidth();
     }
 
     private static CharSequence getCurrentText(View view) {
