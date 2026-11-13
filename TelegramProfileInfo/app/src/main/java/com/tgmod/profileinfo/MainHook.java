@@ -104,7 +104,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
             );
             logD("Hooked ProfileActivity.createView(Context)");
-            discoverItemOptionsAsync(cl);
+            discoverItemOptionsAsync(cl, profileActivityCls.getSuperclass());
         } catch (Throwable t) {
             logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
@@ -326,17 +326,12 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
-    private static void discoverItemOptionsAsync(ClassLoader cl) {
-        if (itemOptionsScanned) {
+    private static void discoverItemOptionsAsync(ClassLoader cl, Class<?> baseFragmentCls) {
+        if (itemOptionsScanned || baseFragmentCls == null) {
             return;
         }
         new Thread(() -> {
             try {
-                Class<?> baseFragmentCls = XposedHelpers.findClassIfExists("org.telegram.ui.ActionBar.BaseFragment", cl);
-                if (baseFragmentCls == null) {
-                    logD("discoverItemOptions: BaseFragment not found");
-                    return;
-                }
 
                 // 1. Fast path: un-obfuscated ItemOptions
                 Class<?> direct = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
