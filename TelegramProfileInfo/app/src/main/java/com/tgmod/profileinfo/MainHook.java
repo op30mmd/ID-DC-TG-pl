@@ -406,11 +406,16 @@ public class MainHook implements IXposedHookLoadPackage {
             int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
             int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
-            if (resProvider == null) {
-                try {
+            try {
+                Object existingBg = XposedHelpers.callMethod(popupLayout, "getBackgroundColor");
+                if (resProvider == null || (existingBg instanceof Integer && ((Integer) existingBg) == 0)) {
                     XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
-                } catch (Throwable ignored) {
                 }
+            } catch (Throwable ignored) {
+            }
+            try {
+                XposedHelpers.callMethod(popupLayout, "setFitItems", true);
+            } catch (Throwable ignored) {
             }
 
             PopupWindow popup = null;
@@ -436,8 +441,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         ViewGroup.LayoutParams.WRAP_CONTENT,
                         true
                 );
-                popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
             }
+            // Prevent OneUI/Android from drawing a system popup frame behind ActionBarPopupWindowLayout
+            popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            popup.setElevation(0f);
             popup.setFocusable(true);
             popup.setOutsideTouchable(true);
 
