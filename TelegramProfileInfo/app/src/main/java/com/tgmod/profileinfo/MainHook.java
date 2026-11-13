@@ -179,11 +179,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
             TextView idDcView = new TextView(context);
             idDcView.setText(labelText);
-            idDcView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-            idDcView.setTextColor(Color.parseColor("#9AA0A6"));
+            idDcView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+            idDcView.setTextColor(Color.parseColor("#A0A6AE"));
             idDcView.setSingleLine(true);
+            idDcView.setIncludeFontPadding(false);
             idDcView.setGravity(Gravity.CENTER_HORIZONTAL);
-            idDcView.setPadding(dp(context, 8), dp(context, 1), dp(context, 8), dp(context, 2));
+            idDcView.setPadding(0, 0, 0, 0);
             idDcView.setClickable(true);
             idDcView.setFocusable(true);
             idDcView.setOnClickListener(v -> showTelegramPopup(profileActivity, v, displayId, deepLink, labelText, dcId > 0, cl));
@@ -197,7 +198,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
             idDcView.bringToFront();
             final View anchor = statusView;
-            final int yOffset = dp(context, 2);
+            final int yOffset = -dp(context, 2);
             final float centerTolerance = dp(context, 24);
             final boolean[] loggedOnce = new boolean[]{false};
             ViewTreeObserver.OnPreDrawListener syncListener = () -> {
@@ -211,7 +212,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     float containerMid = container.getWidth() / 2f;
                     boolean isLeftAligned = Math.abs(anchorMid - containerMid) > centerTolerance;
                     float targetX = isLeftAligned
-                            ? (anchorX - idDcView.getPaddingLeft())
+                            ? (anchorX + anchor.getPaddingLeft())
                             : ((container.getWidth() - idDcView.getWidth()) / 2f);
                     float targetY = anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset;
                     idDcView.setX(Math.max(0f, targetX));
