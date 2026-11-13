@@ -153,11 +153,13 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
 
+            View nameView = null;
             View statusView = null;
             for (View view : candidates) {
                 CharSequence existing = getCurrentText(view);
                 if (candidates.size() > 1 && titleOrFirstName != null && !titleOrFirstName.isEmpty()
                         && existing != null && existing.toString().startsWith(titleOrFirstName)) {
+                    nameView = view;
                     continue;
                 }
                 statusView = view;
@@ -187,7 +189,8 @@ public class MainHook implements IXposedHookLoadPackage {
             idDcView.setPadding(0, 0, 0, 0);
             idDcView.setClickable(true);
             idDcView.setFocusable(true);
-            idDcView.setOnClickListener(v -> showTelegramPopup(profileActivity, v, displayId, deepLink, labelText, dcId > 0, cl));
+            final View themeSourceView = nameView != null ? nameView : statusView;
+            idDcView.setOnClickListener(v -> showTelegramPopup(profileActivity, v, themeSourceView, displayId, deepLink, labelText, dcId > 0, cl));
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -217,6 +220,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     float targetY = anchor.getY() + anchor.getHeight() * anchor.getScaleY() + yOffset;
                     idDcView.setX(Math.max(0f, targetX));
                     idDcView.setY(targetY);
+                    idDcView.setTextColor(resolveAdaptiveTextColor(themeSourceView, anchor));
                     idDcView.setAlpha(anchor.getAlpha());
                     idDcView.setScaleX(anchor.getScaleX());
                     idDcView.setScaleY(anchor.getScaleY());
@@ -241,6 +245,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void showTelegramPopup(
             Object profileActivity,
             View anchor,
+            View themeSourceView,
             String displayId,
             String deepLink,
             String fullLabel,
@@ -254,8 +259,9 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        // Fallback: Telegram-styled popup matching ActionBarPopupWindow geometry, icons, and ripple
-        boolean isDark = isDarkTheme(context);
+        // Fallback: Telegram-styled popup adapting to Telegram's live in-app theme
+        int bgColor = resolvePopupBackgroundColor(profileActivity, context, themeSourceView);
+        boolean isDark = isColorDark(bgColor);
         int bgColor = isDark ? Color.parseColor("#212429") : Color.WHITE;
         int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
         int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
@@ -424,6 +430,64 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
             @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
         };
+    }
+
+    private static int resolveAdaptiveTextColor(View themeSourceView, View anchor) {
+        int baseColor = getViewTextColor(themeSourceView, 0);
+        if (baseColor == 0) {
+            baseColor = getViewTextColor(anchor, Color.parseColor("#A0A6AE"));
+        }
+        // Apply ~72% alpha so it sits subtly below the status line on any background
+        return (baseColor & 0x00FFFFFF) | 0xB8000000;
+    }
+
+    private static int resolvePopupBackgroundColor(Object profileActivity, Context context, View themeSourceView) {
+        try {
+            Object fragmentView = XposedHelpers.getObjectField(profileActivity, "fragmentView");
+            if (fragmentView instanceof View) {
+                Drawable bg = ((View) fragmentView).getBackground();
+                if (bg instanceof ColorDrawable) {
+                    int c = ((ColorDrawable) bg).getColor();
+                    if (Color.alpha(c) > 200) {
+                        return isColorDark(c) ? shiftColor(c, 1.18f) : Color.WHITE;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        int textColor = getViewTextColor(themeSourceView, 0);
+        if (textColor != 0) {
+            boolean lightText = !isColorDark(textColor);
+            return lightText ? Color.parseColor("#212429") : Color.WHITE;
+        }
+        return isDarkTheme(context) ? Color.parseColor("#212429") : Color.WHITE;
+    }
+
+    private static int getViewTextColor(View view, int fallback) {
+        if (view == null) {
+            return fallback;
+        }
+        try {
+            Method getPaint = view.getClass().getMethod("getPaint");
+            Object paint = getPaint.invoke(view);
+            if (paint instanceof Paint) {
+                return ((Paint) paint).getColor();
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
+    private static boolean isColorDark(int color) {
+        double lum = (0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)) / 255.0;
+        return lum < 0.5;
+    }
+
+    private static int shiftColor(int color, float factor) {
+        int r = Math.min(255, Math.round(Color.red(color) * factor + 8));
+        int g = Math.min(255, Math.round(Color.green(color) * factor + 8));
+        int b = Math.min(255, Math.round(Color.blue(color) * factor + 8));
+        return Color.rgb(r, g, b);
     }
 
     private static boolean isDarkTheme(Context context) {
