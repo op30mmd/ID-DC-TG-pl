@@ -292,6 +292,7 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         popup.setElevation(dp(context, 12));
         popup.setOutsideTouchable(true);
+        popup.setAnimationStyle(android.R.style.Animation_Dialog);
 
         card.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
             copyToClipboard(context, "Telegram ID", displayId);
@@ -325,10 +326,12 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Class<?> itemOptionsCls = XposedHelpers.findClassIfExists("org.telegram.ui.Components.ItemOptions", cl);
             if (itemOptionsCls == null) {
+                logD("tryShowNativeItemOptions: org.telegram.ui.Components.ItemOptions not found (likely R8-renamed); using Telegram-styled fallback");
                 return false;
             }
             Object options = XposedHelpers.callStaticMethod(itemOptionsCls, "makeOptions", profileActivity, anchor);
             if (options == null) {
+                logD("tryShowNativeItemOptions: makeOptions returned null");
                 return false;
             }
             Context context = anchor.getContext();
@@ -341,8 +344,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         (Runnable) () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
             }
             XposedHelpers.callMethod(options, "show");
+            logD("tryShowNativeItemOptions: showed native ItemOptions");
             return true;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            logE("tryShowNativeItemOptions failed; falling back to Telegram-styled popup", t);
             return false;
         }
     }
