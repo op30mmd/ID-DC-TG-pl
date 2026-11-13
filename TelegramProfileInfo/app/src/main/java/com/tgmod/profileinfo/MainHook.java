@@ -262,7 +262,6 @@ public class MainHook implements IXposedHookLoadPackage {
         // Fallback: Telegram-styled popup adapting to Telegram's live in-app theme
         int bgColor = resolvePopupBackgroundColor(profileActivity, context, themeSourceView);
         boolean isDark = isColorDark(bgColor);
-        int bgColor = isDark ? Color.parseColor("#212429") : Color.WHITE;
         int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
         int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
