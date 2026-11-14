@@ -263,10 +263,11 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
                             && m.getReturnType() == itemOptionsCls) {
                         foundMake = m;
                     } else if (!Modifier.isStatic(m.getModifiers())
-                            && m.getReturnType() == itemOptionsCls
                             && ((fourArgAdd && p.length == 4 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class && p[3] == boolean.class)
                             || (!fourArgAdd && p.length == 3 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class))) {
-                        foundAdd = m;
+                        if (foundAdd == null || m.getReturnType() == itemOptionsCls) {
+                            foundAdd = m;
+                        }
                     }
                 }
 
