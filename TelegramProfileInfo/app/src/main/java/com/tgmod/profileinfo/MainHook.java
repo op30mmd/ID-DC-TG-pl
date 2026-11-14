@@ -3,16 +3,12 @@ package com.tgmod.profileinfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
-import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.ColorFilter;
 import android.graphics.Paint;
-import android.graphics.PixelFormat;
-import android.graphics.RectF;
-import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.util.TypedValue;
@@ -22,32 +18,47 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.widget.FrameLayout;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.luckypray.dexkit.DexKitBridge;
+import org.luckypray.dexkit.query.FindClass;
+import org.luckypray.dexkit.query.FindMethod;
+import org.luckypray.dexkit.query.matchers.ClassMatcher;
+import org.luckypray.dexkit.query.matchers.MethodMatcher;
+import org.luckypray.dexkit.query.matchers.MethodsMatcher;
+import org.luckypray.dexkit.result.ClassData;
+import org.luckypray.dexkit.result.MethodData;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Obfuscation-immune LSPosed module that displays a clean "ID: <id>, DC: <dc>"
- * line right under the profile status/avatar in ProfileActivity for both users
- * and supergroups/channels, with a Telegram-styled popup menu (Copy, Copy Link, Copy ID & DC).
+ * Obfuscation-immune LSPosed module that displays "ID: <id>, DC: <dc>"
+ * right under profile pictures in ProfileActivity for users and supergroups,
+ * and opens Telegram's native ItemOptions popup menu (resolved via DexKit).
  */
-public class MainHook implements IXposedHookLoadPackage {
+public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private static final String LOG_TAG = "TG-ProfileInfo";
     private static final String TAG = "[TG-ProfileInfo] ";
@@ -58,6 +69,11 @@ public class MainHook implements IXposedHookLoadPackage {
             "org.telegram.messenger.beta"
     ));
 
+    private static volatile String modulePath = null;
+    private static volatile boolean dexKitScanned = false;
+    private static volatile Method makeOptionsMethod = null;
+    private static volatile Method addItemMethod = null;
+    private static volatile Method showOptionsMethod = null;
 
     private static void logD(String msg) {
         XposedBridge.log(TAG + msg);
@@ -70,6 +86,11 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(t);
         }
         Log.e(LOG_TAG, msg, t);
+    }
+
+    @Override
+    public void initZygote(StartupParam startupParam) {
+        modulePath = startupParam.modulePath;
     }
 
     @Override
@@ -93,7 +114,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            attachProfileInfo(param.thisObject, (Context) param.args[0], cl);
+                            Context ctx = (Context) param.args[0];
+                            discoverItemOptionsWithDexKitAsync(ctx, lpparam.appInfo.sourceDir, cl, profileActivityCls.getSuperclass());
+                            attachProfileInfo(param.thisObject, ctx, cl);
                         }
                     }
             );
@@ -101,6 +124,173 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             logE("Failed to hook ProfileActivity.createView(Context)", t);
         }
+    }
+
+    private static boolean loadDexKitNative(Context context) {
+        try {
+            System.loadLibrary("dexkit");
+            return true;
+        } catch (Throwable ignored) {
+        }
+        if (modulePath == null) {
+            return false;
+        }
+        try {
+            String abi = Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0
+                    ? Build.SUPPORTED_ABIS[0] : "arm64-v8a";
+            File outFile = new File(context.getCacheDir(), "libdexkit.so");
+            if (!outFile.exists() || outFile.length() == 0) {
+                try (ZipFile zf = new ZipFile(modulePath)) {
+                    ZipEntry entry = zf.getEntry("lib/" + abi + "/libdexkit.so");
+                    if (entry == null) {
+                        entry = zf.getEntry("lib/arm64-v8a/libdexkit.so");
+                    }
+                    if (entry == null) {
+                        return false;
+                    }
+                    try (InputStream in = zf.getInputStream(entry);
+                         FileOutputStream out = new FileOutputStream(outFile)) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            out.write(buf, 0, n);
+                        }
+                    }
+                }
+            }
+            System.load(outFile.getAbsolutePath());
+            return true;
+        } catch (Throwable t) {
+            logE("Failed to load libdexkit.so", t);
+            return false;
+        }
+    }
+
+    private static void discoverItemOptionsWithDexKitAsync(
+            Context context,
+            String apkPath,
+            ClassLoader cl,
+            Class<?> baseFragmentCls
+    ) {
+        if (dexKitScanned || baseFragmentCls == null || apkPath == null) {
+            return;
+        }
+        dexKitScanned = true;
+        new Thread(() -> {
+            long t0 = System.currentTimeMillis();
+            if (!loadDexKitNative(context)) {
+                logE("Could not load libdexkit.so", null);
+                return;
+            }
+            try (DexKitBridge bridge = DexKitBridge.create(apkPath)) {
+                if (bridge == null) {
+                    logE("DexKitBridge.create returned null", null);
+                    return;
+                }
+
+                // ItemOptions in Telegram 13.x:
+                // - static makeOptions(BaseFragment, View) -> Self
+                // - add(int, CharSequence, Runnable, boolean) -> Self  (or 3-arg without boolean)
+                // - show(): void calling showAtLocation / showAsDropDown
+                ClassData itemOptionsData = bridge.findClass(
+                        FindClass.create().matcher(
+                                ClassMatcher.create().methods(
+                                        MethodsMatcher.create().add(
+                                                MethodMatcher.create()
+                                                        .modifiers(Modifier.STATIC)
+                                                        .paramTypes(baseFragmentCls, View.class)
+                                        ).add(
+                                                MethodMatcher.create()
+                                                        .paramTypes(int.class, CharSequence.class, Runnable.class, boolean.class)
+                                        )
+                                )
+                        )
+                ).singleOrNull();
+
+                boolean fourArgAdd = true;
+                if (itemOptionsData == null) {
+                    fourArgAdd = false;
+                    itemOptionsData = bridge.findClass(
+                            FindClass.create().matcher(
+                                    ClassMatcher.create().methods(
+                                            MethodsMatcher.create().add(
+                                                    MethodMatcher.create()
+                                                            .modifiers(Modifier.STATIC)
+                                                            .paramTypes(baseFragmentCls, View.class)
+                                            ).add(
+                                                    MethodMatcher.create()
+                                                            .paramTypes(int.class, CharSequence.class, Runnable.class)
+                                            )
+                                    )
+                            )
+                    ).singleOrNull();
+                }
+
+                if (itemOptionsData == null) {
+                    logD("DexKit: ItemOptions class not found in " + (System.currentTimeMillis() - t0) + "ms");
+                    return;
+                }
+
+                Class<?> itemOptionsCls = cl.loadClass(itemOptionsData.getName());
+
+                // Find show(): 0-arg void method inside ItemOptions that invokes showAtLocation or showAsDropDown
+                MethodData showData = bridge.findMethod(
+                        FindMethod.create()
+                                .searchInClass(java.util.Collections.singletonList(itemOptionsData))
+                                .matcher(
+                                        MethodMatcher.create()
+                                                .paramCount(0)
+                                                .returnType(void.class)
+                                                .usingStrings() // any; filter by invoked methods below
+                                )
+                ).stream().filter(md -> {
+                    for (MethodData inv : md.getInvokes()) {
+                        String n = inv.getName();
+                        if ("showAtLocation".equals(n) || "showAsDropDown".equals(n)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }).findFirst().orElse(null);
+
+                Method foundMake = null;
+                Method foundAdd = null;
+                Method foundShow = showData != null ? showData.getMethodInstance(cl) : null;
+
+                for (Method m : itemOptionsCls.getDeclaredMethods()) {
+                    Class<?>[] p = m.getParameterTypes();
+                    if (Modifier.isStatic(m.getModifiers())
+                            && p.length == 2 && p[0] == baseFragmentCls && p[1] == View.class
+                            && m.getReturnType() == itemOptionsCls) {
+                        foundMake = m;
+                    } else if (!Modifier.isStatic(m.getModifiers())
+                            && m.getReturnType() == itemOptionsCls
+                            && ((fourArgAdd && p.length == 4 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class && p[3] == boolean.class)
+                            || (!fourArgAdd && p.length == 3 && p[0] == int.class && p[1] == CharSequence.class && p[2] == Runnable.class))) {
+                        foundAdd = m;
+                    }
+                }
+
+                if (foundMake != null && foundAdd != null && foundShow != null) {
+                    foundMake.setAccessible(true);
+                    foundAdd.setAccessible(true);
+                    foundShow.setAccessible(true);
+                    makeOptionsMethod = foundMake;
+                    addItemMethod = foundAdd;
+                    showOptionsMethod = foundShow;
+                    logD("DexKit resolved native ItemOptions: " + itemOptionsCls.getName()
+                            + " (make=" + foundMake.getName()
+                            + ", add=" + foundAdd.getName()
+                            + ", show=" + foundShow.getName()
+                            + ") in " + (System.currentTimeMillis() - t0) + "ms");
+                } else {
+                    logD("DexKit partial match: cls=" + itemOptionsCls.getName()
+                            + " make=" + foundMake + " add=" + foundAdd + " show=" + foundShow);
+                }
+            } catch (Throwable t) {
+                logE("DexKit discovery failed", t);
+            }
+        }, "TG-ProfileInfo-DexKit").start();
     }
 
     private void attachProfileInfo(Object profileActivity, Context context, ClassLoader cl) {
@@ -190,8 +380,9 @@ public class MainHook implements IXposedHookLoadPackage {
             idDcView.setPadding(0, 0, 0, 0);
             idDcView.setClickable(true);
             idDcView.setFocusable(true);
+
             final View themeSourceView = nameView != null ? nameView : statusView;
-            idDcView.setOnClickListener(v -> showTelegramPopup(profileActivity, v, themeSourceView, displayId, deepLink, labelText, dcId > 0, cl));
+            idDcView.setOnClickListener(v -> showNativeOrFallbackPopup(profileActivity, v, themeSourceView, displayId, deepLink, labelText, dcId > 0));
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -199,15 +390,15 @@ public class MainHook implements IXposedHookLoadPackage {
                     Gravity.TOP | Gravity.LEFT
             );
             container.addView(idDcView, lp);
-
             idDcView.bringToFront();
+
             final View anchor = statusView;
             final int yOffset = -dp(context, 2);
             final float minLeftMargin = dp(context, 16);
             final float centerTolerance = dp(context, 24);
             final int[] anchorLoc = new int[2];
             final int[] containerLoc = new int[2];
-            final boolean[] loggedOnce = new boolean[]{false};
+
             ViewTreeObserver.OnPreDrawListener syncListener = () -> {
                 boolean visible = anchor.getVisibility() == View.VISIBLE && anchor.getAlpha() > 0.05f;
                 idDcView.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
@@ -230,12 +421,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     idDcView.setAlpha(anchor.getAlpha());
                     idDcView.setScaleX(anchor.getScaleX());
                     idDcView.setScaleY(anchor.getScaleY());
-                    if (!loggedOnce[0] && container.getWidth() > 0 && idDcView.getWidth() > 0) {
-                        loggedOnce[0] = true;
-                        logD("Layout sync: visualX=" + anchorVisualX + ", anchorX=" + anchor.getX()
-                                + ", textW=" + anchorTextW + ", containerW=" + container.getWidth()
-                                + ", isLeft=" + isLeftAligned + ", targetX=" + targetX + ", targetY=" + targetY);
-                    }
                 }
                 return true;
             };
@@ -247,46 +432,55 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void showTelegramPopup(
+    private static void showNativeOrFallbackPopup(
             Object profileActivity,
             View anchor,
             View themeSourceView,
             String displayId,
             String deepLink,
             String fullLabel,
-            boolean hasDc,
-            ClassLoader cl
+            boolean hasDc
     ) {
         Context context = anchor.getContext();
+        if (makeOptionsMethod != null && addItemMethod != null && showOptionsMethod != null) {
+            try {
+                Object options = makeOptionsMethod.invoke(null, profileActivity, anchor);
+                if (options != null) {
+                    int copyIcon = resolveDrawableId(context, "msg_copy");
+                    int linkIcon = resolveDrawableId(context, "msg_link");
+                    if (linkIcon == 0) linkIcon = resolveDrawableId(context, "msg_link2");
 
-        // Try Telegram's native ItemOptions popup if un-obfuscated in this build
-        if (tryShowNativeItemOptions(profileActivity, anchor, displayId, deepLink, fullLabel, hasDc, cl)) {
-            return;
+                    invokeAddItem(options, copyIcon, "Copy ID",
+                            () -> copyToClipboard(context, "Telegram ID", displayId));
+                    invokeAddItem(options, linkIcon, "Copy Link",
+                            () -> copyToClipboard(context, "Telegram Link", deepLink));
+                    if (hasDc) {
+                        invokeAddItem(options, copyIcon, "Copy ID & DC",
+                                () -> copyToClipboard(context, "Telegram Profile Info", fullLabel));
+                    }
+                    showOptionsMethod.invoke(options);
+                    logD("Showed native Telegram ItemOptions popup");
+                    return;
+                }
+            } catch (Throwable t) {
+                logE("Native ItemOptions failed, using fallback", t);
+            }
         }
 
-        // Fallback: Telegram-styled popup adapting to Telegram's live in-app theme
+        // Fallback if DexKit hasn't finished yet
         int bgColor = resolvePopupBackgroundColor(profileActivity, context, themeSourceView);
         boolean isDark = isColorDark(bgColor);
         int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
-        int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
         LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setMinimumWidth(dp(context, 210));
-        card.setPadding(0, dp(context, 8), 0, dp(context, 8));
+        card.setPadding(0, dp(context, 6), 0, dp(context, 6));
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(bgColor);
-        bg.setCornerRadius(dp(context, 12));
-        card.setBackground(bg);
-
-        TextView header = new TextView(context);
-        header.setText(displayId);
-        header.setTextColor(textColor);
-        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
-        header.setTypeface(Typeface.DEFAULT_BOLD);
-        header.setPadding(dp(context, 18), dp(context, 8), dp(context, 18), dp(context, 10));
-        card.addView(header);
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(isDark ? Color.parseColor("#EB1F2126") : Color.parseColor("#F5FFFFFF"));
+        cardBg.setCornerRadius(dp(context, 16));
+        card.setBackground(cardBg);
 
         PopupWindow popup = new PopupWindow(
                 card,
@@ -295,317 +489,75 @@ public class MainHook implements IXposedHookLoadPackage {
                 true
         );
         popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setElevation(dp(context, 12));
+        popup.setElevation(dp(context, 14));
         popup.setOutsideTouchable(true);
-        popup.setAnimationStyle(android.R.style.Animation_Dialog);
 
-        card.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
+        card.addView(buildFallbackRow(context, textColor, "Copy ID", v -> {
             copyToClipboard(context, "Telegram ID", displayId);
             popup.dismiss();
         }));
-
-        card.addView(buildTelegramRow(context, createLinkIcon(context, iconColor), textColor, "Copy Link", v -> {
+        card.addView(buildFallbackRow(context, textColor, "Copy Link", v -> {
             copyToClipboard(context, "Telegram Link", deepLink);
             popup.dismiss();
         }));
-
         if (hasDc) {
-            card.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy ID & DC", v -> {
+            card.addView(buildFallbackRow(context, textColor, "Copy ID & DC", v -> {
                 copyToClipboard(context, "Telegram Profile Info", fullLabel);
                 popup.dismiss();
             }));
         }
-
-        popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
+        popup.showAsDropDown(anchor, 0, dp(context, 4));
     }
 
-    private static void applyPopupDim(PopupWindow popup, float dimAmount) {
-        try {
-            View container = popup.getContentView().getRootView();
-            android.view.WindowManager wm = (android.view.WindowManager)
-                    container.getContext().getSystemService(Context.WINDOW_SERVICE);
-            if (wm != null && container.getLayoutParams() instanceof android.view.WindowManager.LayoutParams) {
-                android.view.WindowManager.LayoutParams p =
-                        (android.view.WindowManager.LayoutParams) container.getLayoutParams();
-                p.flags |= android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND;
-                p.dimAmount = dimAmount;
-                wm.updateViewLayout(container, p);
-            }
-        } catch (Throwable ignored) {
+    private static void invokeAddItem(Object options, int iconRes, String text, Runnable action) throws Exception {
+        if (addItemMethod.getParameterTypes().length == 4) {
+            addItemMethod.invoke(options, iconRes, text, action, false);
+        } else {
+            addItemMethod.invoke(options, iconRes, text, action);
         }
     }
 
-    private static Class<?> resolveActionBarPopupWindowClass(Class<?> layoutCls) {
-        Class<?> enclosing = layoutCls.getEnclosingClass();
-        if (enclosing != null && PopupWindow.class.isAssignableFrom(enclosing)) {
-            return enclosing;
-        }
-        for (Method m : layoutCls.getMethods()) {
-            if ("setParentWindow".equals(m.getName()) && m.getParameterTypes().length == 1) {
-                Class<?> paramCls = m.getParameterTypes()[0];
-                if (PopupWindow.class.isAssignableFrom(paramCls)) {
-                    return paramCls;
-                }
-            }
-        }
-        return null;
+    private static int resolveDrawableId(Context context, String name) {
+        return context.getResources().getIdentifier(name, "drawable", context.getPackageName());
     }
 
-    private static int resolvePopupDrawableId(Context context) {
-        String[] names = {"popup_fixed_alert4", "popup_fixed_alert3", "popup_fixed_alert2", "popup_fixed_alert"};
-        String pkg = context.getPackageName();
-        for (String name : names) {
-            int id = context.getResources().getIdentifier(name, "drawable", pkg);
-            if (id != 0) {
-                return id;
-            }
-        }
-        return 0;
-    }
-
-    private static ViewGroup instantiatePopupLayout(Class<?> layoutCls, Context context, int resId, Object resProvider) {
-        for (java.lang.reflect.Constructor<?> c : layoutCls.getConstructors()) {
-            Class<?>[] p = c.getParameterTypes();
-            try {
-                if (p.length == 4 && p[0] == int.class && p[1] == int.class
-                        && p[2] == Context.class && resId != 0) {
-                    return (ViewGroup) c.newInstance(resId, 1, context, resProvider);
-                }
-                if (p.length == 3 && p[0] == Context.class && p[1] == int.class) {
-                    return (ViewGroup) c.newInstance(context, resId != 0 ? resId : 0, resProvider);
-                }
-                if (p.length == 2 && p[0] == Context.class) {
-                    return (ViewGroup) c.newInstance(context, resProvider);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        try {
-            return (ViewGroup) XposedHelpers.newInstance(layoutCls, context);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static boolean tryShowNativeItemOptions(
-            Object profileActivity,
-            View anchor,
-            String displayId,
-            String deepLink,
-            String fullLabel,
-            boolean hasDc,
-            ClassLoader cl
-    ) {
-        try {
-            Class<?> layoutCls = XposedHelpers.findClassIfExists(
-                    "org.telegram.ui.ActionBar.ActionBarPopupWindow$ActionBarPopupWindowLayout", cl);
-            if (layoutCls == null) {
-                logD("ActionBarPopupWindowLayout not found");
-                return false;
-            }
-            Context context = anchor.getContext();
-            Object resProvider = null;
-            try {
-                resProvider = XposedHelpers.callMethod(profileActivity, "getResourceProvider");
-            } catch (Throwable ignored) {
-            }
-
-            int shadowResId = resolvePopupDrawableId(context);
-            ViewGroup popupLayout = instantiatePopupLayout(layoutCls, context, shadowResId, resProvider);
-            if (popupLayout == null) {
-                logD("Could not instantiate ActionBarPopupWindowLayout");
-                return false;
-            }
-
-            int bgColor = resolvePopupBackgroundColor(profileActivity, context, anchor);
-            boolean isDark = isColorDark(bgColor);
-            int textColor = isDark ? Color.WHITE : Color.parseColor("#222222");
-            int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
-
-            try {
-                XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
-            } catch (Throwable ignored) {
-            }
-            try {
-                XposedHelpers.callMethod(popupLayout, "setFitItems", true);
-            } catch (Throwable ignored) {
-            }
-
-            PopupWindow popup = null;
-            Class<?> popupCls = resolveActionBarPopupWindowClass(layoutCls);
-            if (popupCls != null && PopupWindow.class.isAssignableFrom(popupCls)) {
-                try {
-                    popup = (PopupWindow) XposedHelpers.newInstance(
-                            popupCls,
-                            popupLayout,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                    );
-                    XposedHelpers.callMethod(popupLayout, "setParentWindow", popup);
-                    logD("Instantiated native ActionBarPopupWindow: " + popupCls.getName());
-                } catch (Throwable t) {
-                    logE("Failed to instantiate ActionBarPopupWindow " + popupCls.getName(), t);
-                }
-            }
-            if (popup == null) {
-                popup = new PopupWindow(
-                        popupLayout,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        true
-                );
-            }
-            // Prevent OneUI/Android from drawing a system popup frame behind ActionBarPopupWindowLayout
-            popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            popup.setElevation(0f);
-            popup.setFocusable(true);
-            popup.setOutsideTouchable(true);
-
-            final PopupWindow finalPopup = popup;
-
-            TextView header = new TextView(context);
-            header.setText(displayId);
-            header.setTextColor(textColor);
-            header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
-            header.setTypeface(Typeface.DEFAULT_BOLD);
-            header.setPadding(dp(context, 18), dp(context, 10), dp(context, 18), dp(context, 10));
-            popupLayout.addView(header);
-
-            View divider = new View(context);
-            divider.setBackgroundColor(isDark ? Color.parseColor("#1FFFFFFF") : Color.parseColor("#14000000"));
-            LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(context, 0.7f)));
-            divLp.bottomMargin = dp(context, 4);
-            popupLayout.addView(divider, divLp);
-
-            popupLayout.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy", v -> {
-                copyToClipboard(context, "Telegram ID", displayId);
-                finalPopup.dismiss();
-            }));
-
-            popupLayout.addView(buildTelegramRow(context, createLinkIcon(context, iconColor), textColor, "Copy Link", v -> {
-                copyToClipboard(context, "Telegram Link", deepLink);
-                finalPopup.dismiss();
-            }));
-
-            if (hasDc) {
-                popupLayout.addView(buildTelegramRow(context, createCopyIcon(context, iconColor), textColor, "Copy ID & DC", v -> {
-                    copyToClipboard(context, "Telegram Profile Info", fullLabel);
-                    finalPopup.dismiss();
-                }));
-            }
-
-            popup.setAnimationStyle(0);
-            popup.setClippingEnabled(false);
-            popup.showAsDropDown(anchor, 0, dp(context, 4));
-            applyPopupDim(popup, 0.35f);
-            try {
-                // Trigger ActionBarPopupWindow's native reveal animation (startAnimation / h)
-                for (Method m : popup.getClass().getDeclaredMethods()) {
-                    if (m.getParameterTypes().length == 0
-                            && m.getReturnType() == void.class
-                            && java.lang.reflect.Modifier.isPublic(m.getModifiers())
-                            && !"dismiss".equals(m.getName())) {
-                        String n = m.getName();
-                        if ("startAnimation".equals(n) || "h".equals(n)) {
-                            m.setAccessible(true);
-                            m.invoke(popup);
-                            break;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
-            logD("Showed native ActionBarPopupWindowLayout popup");
-            return true;
-        } catch (Throwable t) {
-            logE("tryShowNativeItemOptions failed", t);
-            return false;
-        }
-    }
-
-    private static LinearLayout buildTelegramRow(
-            Context context,
-            Drawable icon,
-            int textColor,
-            String label,
-            View.OnClickListener onClick
-    ) {
-        LinearLayout row = new LinearLayout(context);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(context, 18), dp(context, 11), dp(context, 24), dp(context, 11));
-        row.setClickable(true);
-        row.setFocusable(true);
-
-        TypedValue outValue = new TypedValue();
-        if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)) {
-            row.setBackgroundResource(outValue.resourceId);
-        }
-
-        ImageView iv = new ImageView(context);
-        iv.setImageDrawable(icon);
-        LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(dp(context, 22), dp(context, 22));
-        ivLp.rightMargin = dp(context, 18);
-        row.addView(iv, ivLp);
-
+    private static TextView buildFallbackRow(Context context, int textColor, String label, View.OnClickListener onClick) {
         TextView tv = new TextView(context);
         tv.setText(label);
         tv.setTextColor(textColor);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f);
-        row.addView(tv);
-
-        row.setOnClickListener(onClick);
-        return row;
+        tv.setMinimumHeight(dp(context, 48));
+        tv.setGravity(Gravity.CENTER_VERTICAL);
+        tv.setPadding(dp(context, 20), dp(context, 10), dp(context, 24), dp(context, 10));
+        tv.setOnClickListener(onClick);
+        return tv;
     }
 
-    private static Drawable createCopyIcon(Context context, int color) {
-        return new Drawable() {
-            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-            private final float s = dp(context, 22) / 24f;
-            {
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(1.9f * s);
-                p.setStrokeJoin(Paint.Join.ROUND);
-                p.setStrokeCap(Paint.Cap.ROUND);
-                p.setColor(color);
+    private static float getAnchorTextWidth(View view) {
+        try {
+            Method m = view.getClass().getMethod("getTextWidth");
+            Object res = m.invoke(view);
+            if (res instanceof Number && ((Number) res).floatValue() > 0f) {
+                return ((Number) res).floatValue();
             }
-            @Override
-            public void draw(Canvas c) {
-                c.drawRoundRect(new RectF(8 * s, 8 * s, 19 * s, 20 * s), 2 * s, 2 * s, p);
-                c.drawLine(5 * s, 16 * s, 5 * s, 5 * s, p);
-                c.drawLine(5 * s, 5 * s, 15 * s, 5 * s, p);
+        } catch (Throwable ignored) {
+        }
+        CharSequence text = getCurrentText(view);
+        if (text != null && text.length() > 0) {
+            try {
+                Method getPaint = view.getClass().getMethod("getPaint");
+                Object paint = getPaint.invoke(view);
+                if (paint instanceof Paint) {
+                    return ((Paint) paint).measureText(text, 0, text.length());
+                }
+            } catch (Throwable ignored) {
             }
-            @Override public void setAlpha(int alpha) { p.setAlpha(alpha); }
-            @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
-            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
-        };
-    }
-
-    private static Drawable createLinkIcon(Context context, int color) {
-        return new Drawable() {
-            private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-            private final float s = dp(context, 22) / 24f;
-            {
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(1.9f * s);
-                p.setStrokeCap(Paint.Cap.ROUND);
-                p.setColor(color);
-            }
-            @Override
-            public void draw(Canvas c) {
-                c.drawArc(new RectF(3 * s, 8 * s, 11 * s, 16 * s), 90, 180, false, p);
-                c.drawLine(7 * s, 8 * s, 10 * s, 8 * s, p);
-                c.drawLine(7 * s, 16 * s, 10 * s, 16 * s, p);
-                c.drawArc(new RectF(13 * s, 8 * s, 21 * s, 16 * s), -90, 180, false, p);
-                c.drawLine(14 * s, 8 * s, 17 * s, 8 * s, p);
-                c.drawLine(14 * s, 16 * s, 17 * s, 16 * s, p);
-                c.drawLine(8.5f * s, 12 * s, 15.5f * s, 12 * s, p);
-            }
-            @Override public void setAlpha(int alpha) { p.setAlpha(alpha); }
-            @Override public void setColorFilter(ColorFilter cf) { p.setColorFilter(cf); }
-            @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
-        };
+            Paint fallback = new Paint();
+            fallback.setTextSize(TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_SP, 14f, view.getResources().getDisplayMetrics()));
+            return fallback.measureText(text, 0, text.length());
+        }
+        return view.getWidth();
     }
 
     private static int resolveAdaptiveTextColor(View themeSourceView, View anchor) {
@@ -613,7 +565,6 @@ public class MainHook implements IXposedHookLoadPackage {
         if (baseColor == 0) {
             baseColor = getViewTextColor(anchor, Color.parseColor("#A0A6AE"));
         }
-        // Apply ~72% alpha so it sits subtly below the status line on any background
         return (baseColor & 0x00FFFFFF) | 0xB8000000;
     }
 
@@ -633,10 +584,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         int textColor = getViewTextColor(themeSourceView, 0);
         if (textColor != 0) {
-            boolean lightText = !isColorDark(textColor);
-            return lightText ? Color.parseColor("#212429") : Color.WHITE;
+            return !isColorDark(textColor) ? Color.parseColor("#1F2126") : Color.WHITE;
         }
-        return isDarkTheme(context) ? Color.parseColor("#212429") : Color.WHITE;
+        int nightMask = context.getResources().getConfiguration().uiMode
+                & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
+        return nightMask == android.content.res.Configuration.UI_MODE_NIGHT_YES
+                ? Color.parseColor("#1F2126") : Color.WHITE;
     }
 
     private static int getViewTextColor(View view, int fallback) {
@@ -666,12 +619,6 @@ public class MainHook implements IXposedHookLoadPackage {
         return Color.rgb(r, g, b);
     }
 
-    private static boolean isDarkTheme(Context context) {
-        int nightMask = context.getResources().getConfiguration().uiMode
-                & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
-        return nightMask == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-    }
-
     private static void copyToClipboard(Context context, String label, String text) {
         try {
             ClipboardManager cm = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
@@ -687,33 +634,6 @@ public class MainHook implements IXposedHookLoadPackage {
     private static int dp(Context context, float dp) {
         return Math.round(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP, dp, context.getResources().getDisplayMetrics()));
-    }
-
-    private static float getAnchorTextWidth(View view) {
-        try {
-            Method m = view.getClass().getMethod("getTextWidth");
-            Object res = m.invoke(view);
-            if (res instanceof Number && ((Number) res).floatValue() > 0f) {
-                return ((Number) res).floatValue();
-            }
-        } catch (Throwable ignored) {
-        }
-        CharSequence text = getCurrentText(view);
-        if (text != null && text.length() > 0) {
-            try {
-                Method getPaint = view.getClass().getMethod("getPaint");
-                Object paint = getPaint.invoke(view);
-                if (paint instanceof android.graphics.Paint) {
-                    return ((android.graphics.Paint) paint).measureText(text, 0, text.length());
-                }
-            } catch (Throwable ignored) {
-            }
-            android.graphics.Paint fallback = new android.graphics.Paint();
-            fallback.setTextSize(TypedValue.applyDimension(
-                    TypedValue.COMPLEX_UNIT_SP, 14f, view.getResources().getDisplayMetrics()));
-            return fallback.measureText(text, 0, text.length());
-        }
-        return view.getWidth();
     }
 
     private static CharSequence getCurrentText(View view) {
