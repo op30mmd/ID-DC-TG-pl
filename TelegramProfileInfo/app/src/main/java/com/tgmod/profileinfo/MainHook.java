@@ -319,6 +319,22 @@ public class MainHook implements IXposedHookLoadPackage {
         popup.showAsDropDown(anchor, 0, dp(context, 4), Gravity.CENTER_HORIZONTAL);
     }
 
+    private static void applyPopupDim(PopupWindow popup, float dimAmount) {
+        try {
+            View container = popup.getContentView().getRootView();
+            android.view.WindowManager wm = (android.view.WindowManager)
+                    container.getContext().getSystemService(Context.WINDOW_SERVICE);
+            if (wm != null && container.getLayoutParams() instanceof android.view.WindowManager.LayoutParams) {
+                android.view.WindowManager.LayoutParams p =
+                        (android.view.WindowManager.LayoutParams) container.getLayoutParams();
+                p.flags |= android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND;
+                p.dimAmount = dimAmount;
+                wm.updateViewLayout(container, p);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static Class<?> resolveActionBarPopupWindowClass(Class<?> layoutCls) {
         Class<?> enclosing = layoutCls.getEnclosingClass();
         if (enclosing != null && PopupWindow.class.isAssignableFrom(enclosing)) {
@@ -407,10 +423,7 @@ public class MainHook implements IXposedHookLoadPackage {
             int iconColor = isDark ? Color.parseColor("#B0B5BD") : Color.parseColor("#6D737B");
 
             try {
-                Object existingBg = XposedHelpers.callMethod(popupLayout, "getBackgroundColor");
-                if (resProvider == null || (existingBg instanceof Integer && ((Integer) existingBg) == 0)) {
-                    XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
-                }
+                XposedHelpers.callMethod(popupLayout, "setBackgroundColor", bgColor);
             } catch (Throwable ignored) {
             }
             try {
@@ -482,8 +495,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 }));
             }
 
+            popup.setAnimationStyle(0);
             popup.setClippingEnabled(false);
             popup.showAsDropDown(anchor, 0, dp(context, 4));
+            applyPopupDim(popup, 0.35f);
             try {
                 // Trigger ActionBarPopupWindow's native reveal animation (startAnimation / h)
                 for (Method m : popup.getClass().getDeclaredMethods()) {
