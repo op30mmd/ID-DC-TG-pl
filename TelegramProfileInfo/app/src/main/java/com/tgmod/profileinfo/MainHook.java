@@ -241,7 +241,6 @@ public class MainHook implements IXposedHookZygoteInit, IXposedHookLoadPackage {
                                         MethodMatcher.create()
                                                 .paramCount(0)
                                                 .returnType(void.class)
-                                                .usingStrings() // any; filter by invoked methods below
                                 )
                 ).stream().filter(md -> {
                     for (MethodData inv : md.getInvokes()) {
