@@ -33,4 +33,6 @@ android {
 
 dependencies {
     compileOnly("de.robv.android.xposed:api:82")
+    implementation("org.luckypray:dexkit:2.0.2")
+    implementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.24")
 }
